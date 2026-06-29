@@ -30,7 +30,7 @@ html,body{height:100%;background:#fff;font-family:-apple-system,'Hiragino Sans',
 .step-item.done .step-num{background:var(--green);color:#fff}.step-item.active .step-num{background:var(--text);color:#fff}
 .step-div{width:10px;height:1px;background:var(--gray-3);flex-shrink:0}
 /* layout */
-.content{flex:1;overflow-y:auto;padding:14px;-webkit-overflow-scrolling:touch}
+.content{flex:1;overflow-y:auto;padding:14px;-webkit-overflow-scrolling:touch;display:block}
 .content::-webkit-scrollbar{display:none}
 .bottom-bar{padding:10px 14px;padding-bottom:calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid var(--gray-2);flex-shrink:0}
 /* buttons */
@@ -109,7 +109,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;heigh
 .ao{background:var(--orange-light);border-color:#ffcc80;color:#bf360c}
 .errbox{background:#fdecea;border:1.5px solid #ef9a9a;border-radius:var(--radius-sm);padding:12px;font-size:13px;color:#c62828;margin-bottom:10px;line-height:1.6}
 .backbtn{font-size:13px;color:var(--blue);font-weight:700;cursor:pointer;display:flex;align-items:center;gap:3px;margin-bottom:10px;border:none;background:none;padding:0}
-#rtbody{display:block;width:100%}
+#rtbody{display:block !important;width:100%}
 .rt-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
 .rt-stat{background:var(--gray-1);border-radius:var(--radius-sm);padding:12px 14px;display:flex;align-items:center;gap:10px}
 .rt-stat-icon{font-size:22px;flex-shrink:0}
@@ -825,8 +825,8 @@ function regenRt(){
 // ============================================================
 function show(id){
   const el=document.getElementById(id);
-  // rtbodyはblockで展開（loading-boxなどはflex）
-  el.style.display=(id==='rtbody'||id==='stlist'||id==='splist')?'block':'flex';
+  const blockIds=['rtbody','stlist','splist','stcards','spcards'];
+  el.style.display=blockIds.includes(id)?'block':'flex';
 }
 function hide(id){document.getElementById(id).style.display='none';}
 function setMsg(id,t){const el=document.getElementById(id);if(el)el.textContent=t;}
