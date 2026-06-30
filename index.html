@@ -433,8 +433,34 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
     <div id="route-error" class="errbox" style="display:none"></div>
   </div>
   <div class="bottom-bar" id="route-bottom" style="display:none">
-    <button class="btn-main" onclick="completeWalk()">✅ 散歩に出発する</button>
+    <button class="btn-main" onclick="startWalking()">🧭 散歩に出発する</button>
     <button class="btn-sub" onclick="regenRoute()">🔄 別のルートを提案</button>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- D-2: 散歩中（ナビ起動後） -->
+<!-- ============================================================ -->
+<div class="screen" id="screen-walking">
+  <div class="status-bar"><span class="status-time" id="time-7">9:41</span><span class="status-dots">●●●</span></div>
+  <div class="content">
+    <div style="text-align:center;padding:50px 10px 20px">
+      <div style="font-size:64px;margin-bottom:16px">🚶</div>
+      <div style="font-size:20px;font-weight:900;color:var(--text)">散歩中…</div>
+      <div style="font-size:13px;color:var(--text-muted);margin-top:8px;font-weight:600" id="walking-sub"></div>
+    </div>
+
+    <div class="stat-grid" id="walking-stats" style="margin-top:10px"></div>
+
+    <div class="tip-box tip-good" style="margin-top:6px">
+      <span>🗺️</span><span>Googleマップでナビが開いています。終わったら下のボタンで記録しましょう</span>
+    </div>
+
+    <div class="spacer"></div>
+  </div>
+  <div class="bottom-bar">
+    <button class="btn-main" onclick="completeWalk()">✅ 散歩を完了する</button>
+    <button class="btn-sub" onclick="reopenNav()">🧭 もう一度ナビを開く</button>
   </div>
 </div>
 
@@ -508,7 +534,9 @@ const S={
   // 目的地モード
   destPlace:null, destOptions:[], detour:'some', dmood:'relax', davoids:[],
   // スポット
-  spots:[], selSpots:[],
+  spots:[], selSpots:[], spotCandidates:[],
+  // 自動最適化済みルート（API節約のためここに保持し、ルート画面で再利用）
+  autoRouteResult:null, autoRouteKm:null,
   // ルート
   route:null,
   // map
@@ -645,9 +673,8 @@ window.addEventListener('DOMContentLoaded', renderHome);
 function onTimeChange(v){
   v=parseInt(v); S.timeMin=v;
   document.getElementById('time-num').textContent=v;
-  const km=(v/2/13*1).toFixed(1); // 往復のうち半分の時間で歩く距離概算（時速4.5km/h換算で全体距離）
   const totalKm=(v/60*4.5).toFixed(1);
-  document.getElementById('time-dist-est').textContent='往復で約'+totalKm+'km';
+  document.getElementById('time-dist-est').textContent='周回で約'+totalKm+'km（実測で調整します）';
   document.getElementById('time-range').style.setProperty('--pct',((v-5)/55*100).toFixed(1)+'%');
   document.querySelectorAll('#screen-time-setup .preset-btn').forEach(b=>b.classList.remove('active'));
 }
@@ -709,9 +736,9 @@ async function loadRandomSpots(){
     document.getElementById('spots-loading-msg').textContent='周辺スポットを検索中…';
     await whenMapsReadyAsync();
 
-    // 時間設定から検索半径を決定（全体距離の40%程度を半径に）
-    const totalKm=S.timeMin/60*4.5;
-    const radius=Math.max(400, Math.min(Math.round(totalKm*1000*0.35), 2000));
+    // 目標距離（往復4.5km/h換算）の半径で候補を広めに取得（誤差吸収のため候補は多めに）
+    const targetKm=S.timeMin/60*4.5;
+    const radius=Math.max(500, Math.min(Math.round(targetKm*1000*0.45), 2500));
     const center={lat:S.lat,lng:S.lng};
 
     const categories=[
@@ -725,7 +752,7 @@ async function loadRandomSpots(){
     let allSpots=[];
     await Promise.all(categories.map(async cat=>{
       const results=await nearbySearchByType(center, radius, cat.type);
-      results.slice(0,5).forEach(p=>{
+      results.slice(0,8).forEach(p=>{
         allSpots.push({
           id:p.place_id, name:p.name,
           lat:p.geometry.location.lat(), lng:p.geometry.location.lng(),
@@ -743,7 +770,7 @@ async function loadRandomSpots(){
 
     if(allSpots.length===0) throw new Error('周辺にスポットが見つかりませんでした');
 
-    // 距離付与
+    // 距離付与（直線距離、ソートの目安としてのみ使用。実測はDirections APIで行う）
     allSpots=allSpots.map(sp=>{
       const d=distKm(S.lat,S.lng,sp.lat,sp.lng);
       return {...sp, distFromHome:Math.round(d*1000), walkMin:Math.round(d*1.3/4.5*60)};
@@ -755,15 +782,89 @@ async function loadRandomSpots(){
       return a.distFromHome-b.distFromHome;
     });
 
-    // 詳細文言をローカル生成
-    S.spots=enrichSpotsLocal(allSpots.slice(0,10));
-    S.selSpots=[];
-    renderSpotsGrid(S.spots, 'おまかせスポット（未訪問を優先表示）');
+    // 候補は最大16件保持（自動最適化の探索素材として）
+    S.spotCandidates=allSpots.slice(0,16);
+    document.getElementById('spots-loading-msg').textContent='ベストなルートを計算中…';
+
+    // 自動でベストな組み合わせをDirections APIで探索
+    const best=await findBestSpotCombo(S.spotCandidates, targetKm, null);
+    S.spots=enrichSpotsLocal(best.candidatesShown);
+    S.selSpots=best.selected;
+    S.autoRouteResult=best.dirResult;
+    S.autoRouteKm=best.km;
+
+    renderSpotsGrid(S.spots, 'おまかせスポット（自動選択済み・タップで変更可）', S.selSpots);
     hide2('spots-loading'); show2('spots-body');
+
+    document.getElementById('spots-count').textContent =
+      `目標${targetKm.toFixed(1)}km → このルートで約${best.km.toFixed(1)}km（タップで増減できます）`;
   }catch(e){
     hide2('spots-loading'); show2('spots-error');
     document.getElementById('spots-error').textContent='エラー: '+e.message;
   }
+}
+
+// ============================================================
+// 自動ルート最適化：候補スポットから複数パターンを実測し、目標距離に最も近い組み合わせを採用
+// mode: 'loop'（おまかせ＝周回） or 'destination'（目的地モード）
+// ============================================================
+async function findBestSpotCombo(candidates, targetKm, destPlace){
+  const isLoop = destPlace===null;
+  const origin={lat:S.lat,lng:S.lng};
+  const destination = isLoop ? origin : {lat:destPlace.lat,lng:destPlace.lng};
+
+  // 試すパターン数を絞る（API呼び出し節約のため上位候補から組み立て）
+  const pool=candidates.slice(0,8);
+  const patterns=[];
+  patterns.push([]); // 0件（直行/周回のみ）
+  pool.forEach(sp=>patterns.push([sp])); // 1件ずつ
+  // 2件の組み合わせ（近い順の隣接ペアのみ、総当たりは避ける）
+  for(let i=0;i<pool.length-1 && patterns.length<14;i++){
+    patterns.push([pool[i],pool[i+1]]);
+  }
+  // 3件の組み合わせ（先頭3つ、先頭+中間など軽く）
+  if(pool.length>=3) patterns.push([pool[0],pool[1],pool[2]]);
+  if(pool.length>=4) patterns.push([pool[1],pool[2],pool[3]]);
+
+  let best=null;
+  for(const combo of patterns){
+    try{
+      const dirResult=await calcDirectionsFor(origin, destination, combo, isLoop);
+      const km=dirResult.routes[0].legs.reduce((s,l)=>s+l.distance.value,0)/1000;
+      const diff=Math.abs(km-targetKm);
+      if(!best || diff<best.diff){
+        best={diff, km, combo, dirResult};
+      }
+      // 目標の20%以内に入ったら十分良いので探索を打ち切る（API節約）
+      if(diff <= targetKm*0.2 && combo.length>0){
+        break;
+      }
+    }catch(e){ /* このパターンは失敗、次へ */ }
+  }
+
+  if(!best){
+    // 全パターン失敗時のフォールバック：直線距離ベースで近いものを1件選ぶ
+    const fallbackCombo = pool.length>0 ? [pool[0]] : [];
+    return {selected:fallbackCombo, candidatesShown:candidates, dirResult:null, km:targetKm};
+  }
+
+  return {selected:best.combo, candidatesShown:candidates, dirResult:best.dirResult, km:best.km};
+}
+
+function calcDirectionsFor(origin, destination, spots, isLoop){
+  return new Promise((res,rej)=>{
+    const svc=new google.maps.DirectionsService();
+    const waypoints=spots.map(sp=>({location:{lat:sp.lat,lng:sp.lng}, stopover:true}));
+    svc.route({
+      origin, destination, waypoints,
+      travelMode:google.maps.TravelMode.WALKING,
+      optimizeWaypoints:true,
+      language:'ja'
+    },(result,status)=>{
+      if(status==='OK') res(result);
+      else rej(new Error('Directions API: '+status));
+    });
+  });
 }
 
 function enrichSpotsLocal(spots){
@@ -785,11 +886,11 @@ function enrichSpotsLocal(spots){
 // ============================================================
 // スポット表示（共通：おまかせ・目的地モード両方で使う）
 // ============================================================
-function renderSpotsGrid(spots, title){
+function renderSpotsGrid(spots, title, preSelected){
   document.getElementById('spots-title').textContent=title;
-  document.getElementById('spots-count').textContent='スポットを選んでください（複数選択可・0件でもOK）';
   const area=document.getElementById('spots-grid-area');
   area.innerHTML='';
+  const selectedIds=new Set((preSelected||S.selSpots).map(s=>s.id));
   const groups={};
   spots.forEach(sp=>{ if(!groups[sp.category]) groups[sp.category]=[]; groups[sp.category].push(sp); });
   const catEmoji={'カフェ':'☕','ベーカリー':'🍞','飲食':'🍜','雑貨・ショップ':'🛍️','公園':'🌿'};
@@ -798,7 +899,9 @@ function renderSpotsGrid(spots, title){
     sec.innerHTML=`<div class="lbl">${catEmoji[cat]||'📍'} ${cat}</div>`;
     const grid=document.createElement('div'); grid.className='sgrid';
     items.forEach(sp=>{
-      const card=document.createElement('div'); card.className='spot-card'; card.dataset.id=sp.id;
+      const card=document.createElement('div');
+      card.className='spot-card'+(selectedIds.has(sp.id)?' selected':'');
+      card.dataset.id=sp.id;
       const newBadge=!sp.visited?'<span class="new-dot"></span>':'';
       card.innerHTML=`<div class="spot-chk">✓</div>
         <div class="spot-emoji">${sp.emoji}</div>
@@ -812,11 +915,20 @@ function renderSpotsGrid(spots, title){
   });
 }
 
+// 手動でスポットを変更したら、自動計算したルートは無効化（再計算が必要になる）
 function toggleSpotSel(sp,card){
   card.classList.toggle('selected');
   const i=S.selSpots.findIndex(s=>s.id===sp.id);
   if(i>=0) S.selSpots.splice(i,1); else S.selSpots.push(sp);
-  document.getElementById('spots-count').textContent = S.selSpots.length>0 ? S.selSpots.length+'か所選択中' : 'スポットを選んでください（複数選択可・0件でもOK）';
+  S.autoRouteResult=null; // 手動変更したので実測ルートをリセット
+  const targetKm=S.mode==='destination'?null:(S.timeMin/60*4.5);
+  if(targetKm){
+    document.getElementById('spots-count').textContent = S.selSpots.length>0
+      ? S.selSpots.length+'か所選択中（目標'+targetKm.toFixed(1)+'km・ルート作成時に再計算します）'
+      : 'スポットを選んでください（目標'+targetKm.toFixed(1)+'km）';
+  } else {
+    document.getElementById('spots-count').textContent = S.selSpots.length>0 ? S.selSpots.length+'か所選択中' : 'スポットを選んでください（複数選択可・0件でもOK）';
+  }
 }
 
 // ============================================================
@@ -924,8 +1036,8 @@ function togDAvoid(el,key){
 async function startDestWalk(){
   S.mode='destination';
   if(S.detour==='none'){
-    // 寄り道なしなら直接ルート画面へ
-    S.selSpots=[];
+    // 寄り道なしなら直行ルートをそのまま計算
+    S.selSpots=[]; S.autoRouteResult=null;
     prevRouteScreen='dest-time';
     goScreen('route');
     await loadRoute();
@@ -939,14 +1051,27 @@ async function startDestWalk(){
 
 async function loadDestSpots(){
   show2('spots-loading'); hide2('spots-body'); hide2('spots-error');
-  document.getElementById('spots-loading-msg').textContent='寄り道スポットを検索中…';
+  document.getElementById('spots-loading-msg').textContent='直行ルートを計算中…';
   try{
     await whenMapsReadyAsync();
+
+    // まず直行ルート（寄り道なし）の実測距離を測る
+    const origin={lat:S.lat,lng:S.lng};
+    const destination={lat:S.destPlace.lat,lng:S.destPlace.lng};
+    let directKm;
+    try{
+      const directResult=await calcDirectionsFor(origin, destination, [], false);
+      directKm=directResult.routes[0].legs.reduce((s,l)=>s+l.distance.value,0)/1000;
+    }catch(e){
+      directKm=distKm(S.lat,S.lng,S.destPlace.lat,S.destPlace.lng)*1.3;
+    }
+
+    document.getElementById('spots-loading-msg').textContent='寄り道スポットを検索中…';
     // 出発地〜目的地の中間あたりを検索中心に
     const midLat=(S.lat+S.destPlace.lat)/2;
     const midLng=(S.lng+S.destPlace.lng)/2;
     const center={lat:midLat,lng:midLng};
-    const radius=600;
+    const radius=Math.max(500, Math.round(directKm*1000*0.4));
 
     const categories=[
       {type:'cafe', label:'カフェ', tagClass:'cafe', emoji:'☕'},
@@ -957,7 +1082,7 @@ async function loadDestSpots(){
     let allSpots=[];
     await Promise.all(categories.map(async cat=>{
       const results=await nearbySearchByType(center, radius, cat.type);
-      results.slice(0,4).forEach(p=>{
+      results.slice(0,6).forEach(p=>{
         if(p.place_id===S.destPlace.id) return; // 目的地自体は除外
         allSpots.push({
           id:p.place_id, name:p.name,
@@ -972,7 +1097,7 @@ async function loadDestSpots(){
 
     if(allSpots.length===0){
       // 寄り道なしで進める
-      S.spots=[]; S.selSpots=[];
+      S.spots=[]; S.selSpots=[]; S.autoRouteResult=null;
       hide2('spots-loading');
       document.getElementById('spots-body').style.display='block';
       document.getElementById('spots-title').textContent='寄り道スポット';
@@ -987,11 +1112,22 @@ async function loadDestSpots(){
     });
     allSpots.sort((a,b)=>{ if(a.visited!==b.visited) return a.visited?1:-1; return a.distFromHome-b.distFromHome; });
 
-    const maxSpots=S.detour==='some'?6:0;
-    S.spots=enrichSpotsLocal(allSpots.slice(0,maxSpots));
-    S.selSpots=[];
-    renderSpotsGrid(S.spots, '寄り道スポット（行き先までの道沿い）');
+    S.spotCandidates=allSpots.slice(0,8);
+
+    // 寄り道の目標距離 = 直行距離 + 少し（「少し寄り道」想定で+20〜40%）
+    const targetKm = directKm * 1.3;
+    document.getElementById('spots-loading-msg').textContent='ベストな寄り道を計算中…';
+    const best=await findBestSpotCombo(S.spotCandidates, targetKm, S.destPlace);
+
+    S.spots=enrichSpotsLocal(allSpots.slice(0,8));
+    S.selSpots=best.selected;
+    S.autoRouteResult=best.dirResult;
+    S.autoRouteKm=best.km;
+
+    renderSpotsGrid(S.spots, '寄り道スポット（自動選択済み・タップで変更可）', S.selSpots);
     hide2('spots-loading'); show2('spots-body');
+    document.getElementById('spots-count').textContent =
+      `直行${directKm.toFixed(1)}km → 寄り道込みで約${best.km.toFixed(1)}km（タップで増減できます）`;
   }catch(e){
     hide2('spots-loading'); show2('spots-error');
     document.getElementById('spots-error').textContent='エラー: '+e.message;
@@ -1014,10 +1150,15 @@ async function loadRoute(){
   try{
     await whenMapsReadyAsync();
 
-    document.getElementById('route-loading-msg').textContent='徒歩ルートを検索中…';
     let dirResult=null;
-    try{ dirResult=await calcDirections(); }
-    catch(e){ console.warn('Directions API失敗、概算モードで続行:', e.message); }
+    // スポット選択画面で既に自動最適化済みのルートがあれば再利用（API節約・誤差最小のルート）
+    if(S.autoRouteResult){
+      dirResult=S.autoRouteResult;
+    } else {
+      document.getElementById('route-loading-msg').textContent='徒歩ルートを検索中…';
+      try{ dirResult=await calcDirections(); }
+      catch(e){ console.warn('Directions API失敗、概算モードで続行:', e.message); }
+    }
 
     document.getElementById('route-loading-msg').textContent='高低差情報を取得中…';
     const elevData = dirResult ? await fetchElevation(dirResult) : {up:null,down:null,maxSlope:null};
@@ -1215,6 +1356,36 @@ function initGMap(dirResult){
 
 function regenRoute(){
   loadRoute();
+}
+
+// ============================================================
+// ナビ起動 → 「散歩中」画面へ（まだ記録は確定しない）
+// ============================================================
+function buildNavUrl(){
+  const destPt = S.mode==='destination' && S.destPlace ? {lat:S.destPlace.lat,lng:S.destPlace.lng} : {lat:S.lat,lng:S.lng};
+  const wpStr=S.selSpots.map(sp=>`${sp.lat},${sp.lng}`).join('/');
+  return `https://www.google.com/maps/dir/?api=1&origin=${S.lat},${S.lng}&destination=${destPt.lat},${destPt.lng}`
+    + (wpStr ? `&waypoints=${encodeURIComponent(wpStr.replace(/\//g,'|'))}` : '')
+    + `&travelmode=walking`;
+}
+
+function startWalking(){
+  // Googleマップでナビを開く
+  window.open(buildNavUrl(), '_blank');
+
+  // 「散歩中」画面に表示する情報を準備
+  const rd=S.route.routeData;
+  document.getElementById('walking-sub').textContent = rd.title + '・' + rd.totalDist + 'km・約' + rd.totalTime + '分';
+  document.getElementById('walking-stats').innerHTML = `
+    <div class="stat-card"><div class="stat-icon">🗺️</div><div><div class="stat-val">${rd.totalDist}</div><div class="stat-lbl">km</div></div></div>
+    <div class="stat-card"><div class="stat-icon">⏱️</div><div><div class="stat-val">${rd.totalTime}</div><div class="stat-lbl">分</div></div></div>`;
+
+  S.walkStartedAt = Date.now();
+  goScreen('walking');
+}
+
+function reopenNav(){
+  window.open(buildNavUrl(), '_blank');
 }
 
 // ============================================================
