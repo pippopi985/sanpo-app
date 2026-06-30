@@ -833,9 +833,16 @@ async function loadRandomDestinations(){
 
     // 許容誤差：設定時間の15%、ただし最大15分
     const allowedDiff = Math.min(targetMin*0.15, 15);
+    // 緩和許容誤差：どうしても候補が足りない場合のみ、誤差30%までは許容（無制限の妥協はしない）
+    const relaxedDiff = targetMin*0.3;
+
     let filtered=measured.filter(c=>c.diff<=allowedDiff);
     if(filtered.length<3){
-      filtered=[...measured].sort((a,b)=>a.diff-b.diff).slice(0,Math.max(3,filtered.length));
+      const relaxed=measured.filter(c=>c.diff<=relaxedDiff).sort((a,b)=>a.diff-b.diff);
+      filtered=relaxed.slice(0, Math.max(3, filtered.length));
+    }
+    if(filtered.length===0){
+      throw new Error(`設定時間（片道${targetMin}分）に近い行き先が見つかりませんでした。時間を変えてお試しください`);
     }
     filtered.sort((a,b)=>a.diff-b.diff);
 
@@ -859,7 +866,7 @@ function renderRandDestCandidates(candidates, targetMin, allowedDiff){
   candidates.forEach(c=>{
     const card=document.createElement('div'); card.className='rdest-card';
     const diffClass=c.diff<=allowedDiff?'ok':'far';
-    const diffLabel=c.diff<=allowedDiff?'ちょうどいい':'やや差あり';
+    const diffLabel=c.diff<=allowedDiff?'ちょうどいい':`目標と${Math.round(c.diff)}分差`;
     card.innerHTML=`
       <div class="rdest-compass">${c.dirIcon}</div>
       <div class="rdest-info">
@@ -1030,7 +1037,11 @@ async function findBestSpotCombo(candidates, target, destPlace, options){
   const effAllowedDiff = allowedDiff!==undefined ? allowedDiff : target*0.2;
 
   let best=null;
+  let triedCount=0;
+  const maxTries=10; // API節約のため試行数に上限（近い候補から優先的に試す）
   for(const combo of patterns){
+    if(triedCount>=maxTries && best && best.diff<=effAllowedDiff) break; // 十分良い解が見つかっていれば打ち切り
+    if(triedCount>=maxTries+4) break; // 上限を超えたら強制終了（API節約の保険）
     try{
       const dirResult=await calcDirectionsFor(origin, destination, combo, isLoop);
       const km=dirResult.routes[0].legs.reduce((s,l)=>s+l.distance.value,0)/1000;
@@ -1040,11 +1051,22 @@ async function findBestSpotCombo(candidates, target, destPlace, options){
       if(!best || diff<best.diff){
         best={diff, km, min, combo, dirResult};
       }
-      // 許容誤差以内に入ったら十分良いので探索を打ち切る（API節約）
-      if(diff <= effAllowedDiff && combo.length>0){
-        break;
+      triedCount++;
+    }catch(e){ triedCount++; /* このパターンは失敗、次へ */ }
+  }
+
+  // 最良解でも許容誤差を大きく超える場合（誤差が目標の50%以上）は、寄り道なしの素のルートと比較して安全な方を採る
+  if(best && best.diff > target*0.5 && best.combo.length>0){
+    try{
+      const plainResult=await calcDirectionsFor(origin, destination, [], isLoop);
+      const plainKm=plainResult.routes[0].legs.reduce((s,l)=>s+l.distance.value,0)/1000;
+      const plainMin=plainResult.routes[0].legs.reduce((s,l)=>s+l.duration.value,0)/60;
+      const plainMeasure = byTime ? plainMin : plainKm;
+      const plainDiff=Math.abs(plainMeasure-target);
+      if(plainDiff<best.diff){
+        best={diff:plainDiff, km:plainKm, min:plainMin, combo:[], dirResult:plainResult};
       }
-    }catch(e){ /* このパターンは失敗、次へ */ }
+    }catch(e){ /* 失敗したら今のbestをそのまま使う */ }
   }
 
   if(!best){
@@ -1599,6 +1621,19 @@ function buildRouteData(dirResult, elevData){
 
   const chips=[];
   chips.push({text: S.destPlace?'目的地さんぽ':(mood==='relax'?'のんびりコース':'アクティブコース'), type:'good'});
+
+  // おまかせモード：設定した片道目標時間との差を明示
+  if(S.mode==='random' && S.totalMinTarget){
+    const timeDiff=Math.round(totalTime - S.totalMinTarget);
+    if(Math.abs(timeDiff)<=3){
+      chips.push({text:'目標通り('+S.totalMinTarget+'分)',type:'good'});
+    } else if(timeDiff>0){
+      chips.push({text:'目標より+'+timeDiff+'分',type: timeDiff>15?'bad':'warn'});
+    } else {
+      chips.push({text:'目標より'+timeDiff+'分',type:'good'});
+    }
+  }
+
   if(elevData.maxSlope!==null){
     const slope=parseFloat(elevData.maxSlope);
     if(slope<3) chips.push({text:'ほぼ平坦',type:'good'});
