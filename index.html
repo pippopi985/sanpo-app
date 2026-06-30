@@ -573,7 +573,7 @@ const S={
   destPlace:null, destOptions:[], detour:'some', dmood:'relax', davoids:[],
   // おまかせモード：目的地候補
   randDestCandidates:[], targetKmForRandom:null,
-  totalMinTarget:null, detourBudgetMin:null, randSelectedRoundTripMin:null,
+  totalMinTarget:null,
   // スポット
   spots:[], selSpots:[], spotCandidates:[],
   // 自動最適化済みルート（API節約のためここに保持し、ルート画面で再利用）
@@ -770,17 +770,13 @@ async function loadRandomDestinations(){
     if(!S.lat){ const pos=await getLoc(); S.lat=pos.lat; S.lng=pos.lng; }
     await whenMapsReadyAsync();
 
-    // 設定時間は「出発〜帰宅までの総時間」。寄り道分（約25%）を確保し、残りを往復の移動時間予算にする
-    const totalMin = S.timeMin;
-    const detourBudgetMin = totalMin * 0.25;
-    const travelBudgetMin = totalMin - detourBudgetMin; // 往復の移動に使える時間
-    const onewayMin = travelBudgetMin / 2; // 片道の目安時間
-    const targetKm = onewayMin/60*4.5; // 片道の道のり目標距離（探索の起点用）
+    // 設定時間は「片道」の目安。帰りは後で自分で決める前提
+    const targetMin = S.timeMin;
+    const targetKm = targetMin/60*4.5; // 片道の道のり目標距離（探索の起点用）
 
-    S.totalMinTarget = totalMin;
-    S.detourBudgetMin = detourBudgetMin;
+    S.totalMinTarget = targetMin; // 互換のため残す（片道として扱う）
 
-    document.getElementById('rand-dest-sub').textContent=`往復+寄り道で合計${totalMin}分くらいの行き先を探しています`;
+    document.getElementById('rand-dest-sub').textContent=`片道約${targetMin}分の行き先を探しています`;
     document.getElementById('rand-dest-loading-msg').textContent='8方向を探索中…';
 
     // 各方角で仮地点を計算し、その周辺でPlacesを検索
@@ -812,23 +808,17 @@ async function loadRandomDestinations(){
 
     if(rawCandidates.length===0) throw new Error('周辺に候補地が見つかりませんでした。距離設定を変えてお試しください');
 
-    document.getElementById('rand-dest-loading-msg').textContent='往復時間を実測中…';
+    document.getElementById('rand-dest-loading-msg').textContent='片道時間を実測中…';
 
-    // 各候補は「周回（出発地→候補地→出発地）」の往復時間で実測する（寄り道なしの素の往復）
+    // 各候補は片道の実測時間で評価する
     const measured=[];
     const failReasons=[];
     for(const c of rawCandidates){
       try{
-        // 往路
         const goResult=await calcDirectionsFor({lat:S.lat,lng:S.lng}, {lat:c.lat,lng:c.lng}, [], false);
         const goMin = goResult.routes[0].legs.reduce((s,l)=>s+l.duration.value,0)/60;
         const goKm = goResult.routes[0].legs.reduce((s,l)=>s+l.distance.value,0)/1000;
-        // 往復は同じ経路をほぼ往復すると仮定して2倍（API呼び出しを節約）
-        const roundTripMin = goMin*2;
-        const roundTripKm = goKm*2;
-        // 寄り道予算を足した「想定総時間」
-        const estimatedTotalMin = roundTripMin + detourBudgetMin;
-        measured.push({...c, walkKm:goKm, walkMin:Math.round(goMin), roundTripMin, estimatedTotalMin, diff:Math.abs(estimatedTotalMin-totalMin)});
+        measured.push({...c, walkKm:goKm, walkMin:Math.round(goMin), diff:Math.abs(goMin-targetMin)});
       }catch(e){
         failReasons.push(e.message);
         console.warn('候補失敗:', c.name, e.message);
@@ -842,7 +832,7 @@ async function loadRandomDestinations(){
     }
 
     // 許容誤差：設定時間の15%、ただし最大15分
-    const allowedDiff = Math.min(totalMin*0.15, 15);
+    const allowedDiff = Math.min(targetMin*0.15, 15);
     let filtered=measured.filter(c=>c.diff<=allowedDiff);
     if(filtered.length<3){
       filtered=[...measured].sort((a,b)=>a.diff-b.diff).slice(0,Math.max(3,filtered.length));
@@ -851,7 +841,7 @@ async function loadRandomDestinations(){
 
     S.randDestCandidates=filtered;
     S.targetKmForRandom=targetKm;
-    renderRandDestCandidates(filtered, totalMin, allowedDiff);
+    renderRandDestCandidates(filtered, targetMin, allowedDiff);
     hide2('rand-dest-loading');
   }catch(e){
     hide2('rand-dest-loading'); show2('rand-dest-error');
@@ -859,7 +849,7 @@ async function loadRandomDestinations(){
   }
 }
 
-function renderRandDestCandidates(candidates, totalMin, allowedDiff){
+function renderRandDestCandidates(candidates, targetMin, allowedDiff){
   const el=document.getElementById('rand-dest-results');
   el.innerHTML='';
   if(candidates.length===0){
@@ -877,7 +867,7 @@ function renderRandDestCandidates(candidates, totalMin, allowedDiff){
         <div class="rdest-meta">
           <span class="rdest-dir">${c.dirLabel}方向</span>
           <span class="rdest-diff ${diffClass}">${diffLabel}</span>
-          <span>🚶 片道${c.walkMin}分・往復約${Math.round(c.roundTripMin)}分</span>
+          <span>🚶 片道 ${c.walkKm.toFixed(1)}km・${c.walkMin}分</span>
         </div>
       </div>`;
     card.onclick=()=>selectRandomDestination(c);
@@ -885,11 +875,10 @@ function renderRandDestCandidates(candidates, totalMin, allowedDiff){
   });
 }
 
-// 候補を1つ選んだら寄り道探索へ（残り予算内に収める）
+// 候補を1つ選んだら寄り道探索へ（片道ルートに寄り道を組み込む）
 function selectRandomDestination(chosen){
   S.destPlace={id:chosen.place_id, name:chosen.name, lat:chosen.lat, lng:chosen.lng, walkMin:chosen.walkMin};
   S.selSpots=[]; S.autoRouteResult=null;
-  S.randSelectedRoundTripMin = chosen.roundTripMin;
 
   prevSpotScreen='rand-dest';
   prevRouteScreen='spots';
@@ -945,7 +934,7 @@ async function loadRandomSpots(){
     document.getElementById('spots-loading-msg').textContent='周辺スポットを検索中…';
     await whenMapsReadyAsync();
 
-    // 目標距離（往復4.5km/h換算）の半径で候補を広めに取得（誤差吸収のため候補は多めに）
+    // 目標距離（片道4.5km/h換算）の半径で候補を広めに取得（誤差吸収のため候補は多めに）
     const targetKm=S.timeMin/60*4.5;
     const radius=Math.max(500, Math.min(Math.round(targetKm*1000*0.45), 2500));
     const center={lat:S.lat,lng:S.lng};
@@ -1339,7 +1328,7 @@ async function startDestWalk(){
 }
 
 // ============================================================
-// おまかせ散歩：寄り道スポット探索（往復+寄り道の合計が設定時間に収まるよう選ぶ）
+// おまかせ散歩：寄り道スポット探索（片道+寄り道の合計が設定時間に収まるよう選ぶ）
 // ============================================================
 async function loadRandomModeSpots(){
   show2('spots-loading'); hide2('spots-body'); hide2('spots-error');
@@ -1351,8 +1340,8 @@ async function loadRandomModeSpots(){
     const midLat=(S.lat+S.destPlace.lat)/2;
     const midLng=(S.lng+S.destPlace.lng)/2;
     const center={lat:midLat,lng:midLng};
-    const roundTripKmEst = (S.randSelectedRoundTripMin||20)/60*4.5;
-    const radius=Math.max(400, Math.round(roundTripKmEst*1000*0.25));
+    const onewayKmEst = (S.totalMinTarget||S.timeMin)/60*4.5;
+    const radius=Math.max(400, Math.round(onewayKmEst*1000*0.25));
 
     const categories=[
       {type:'cafe', label:'カフェ', tagClass:'cafe', emoji:'☕'},
@@ -1397,11 +1386,10 @@ async function loadRandomModeSpots(){
 
     S.spotCandidates=allSpots.slice(0,8);
 
-    // 設定した総時間（往復+寄り道）に収まる組み合わせを、許容誤差「15%・最大15分」で探索
-    // 目的地(S.destPlace)は経由地として扱い、最終ゴールは出発地に戻す周回ルートで測る
+    // 片道の合計時間（移動+寄り道）が設定時間に近づく組み合わせを、許容誤差「15%・最大15分」で探索
     const allowedDiff = Math.min(totalMinTarget*0.15, 15);
-    document.getElementById('spots-loading-msg').textContent='合計' + totalMinTarget + '分に収まるよう調整中…';
-    const best=await findBestRoundTripCombo(S.spotCandidates, S.destPlace, totalMinTarget, allowedDiff);
+    document.getElementById('spots-loading-msg').textContent='片道' + totalMinTarget + '分に収まるよう調整中…';
+    const best=await findBestSpotCombo(S.spotCandidates, totalMinTarget, S.destPlace, {byTime:true, allowedDiff});
 
     S.spots=enrichSpotsLocal(allSpots.slice(0,8));
     S.selSpots=best.selected;
@@ -1413,50 +1401,11 @@ async function loadRandomModeSpots(){
     hide2('spots-loading'); show2('spots-body');
     const diffNote = Math.abs(best.min-totalMinTarget) <= allowedDiff ? '' : '（目標との差がやや大きめです）';
     document.getElementById('spots-count').textContent =
-      `目標合計${totalMinTarget}分 → このルートで約${Math.round(best.min)}分${diffNote}（タップで増減できます）`;
+      `目標片道${totalMinTarget}分 → このルートで約${Math.round(best.min)}分${diffNote}（タップで増減できます）`;
   }catch(e){
     hide2('spots-loading'); show2('spots-error');
     document.getElementById('spots-error').textContent='エラー: '+e.message;
   }
-}
-
-// ============================================================
-// おまかせ散歩専用：目的地を経由地に固定し、出発地に戻る周回ルートの時間を
-// 設定総時間に近づける組み合わせを探索する
-// ============================================================
-async function findBestRoundTripCombo(candidates, destPlace, targetMin, allowedDiff){
-  const origin={lat:S.lat,lng:S.lng};
-  const destPt={lat:destPlace.lat,lng:destPlace.lng};
-
-  const pool=candidates.slice(0,6); // 周回は1パターンあたり経由地が多くなるため候補は絞る
-  const patterns=[];
-  patterns.push([]); // 寄り道なし（目的地のみ経由して周回）
-  pool.forEach(sp=>patterns.push([sp])); // 寄り道1件
-  for(let i=0;i<pool.length-1 && patterns.length<8;i++){
-    patterns.push([pool[i],pool[i+1]]); // 寄り道2件
-  }
-
-  let best=null;
-  for(const combo of patterns){
-    try{
-      // 目的地は必ず経由地に含め、最終ゴールは出発地（周回）
-      const waypoints=[...combo, destPlace];
-      const dirResult=await calcDirectionsFor(origin, origin, waypoints, true);
-      const min=dirResult.routes[0].legs.reduce((s,l)=>s+l.duration.value,0)/60;
-      const km=dirResult.routes[0].legs.reduce((s,l)=>s+l.distance.value,0)/1000;
-      const diff=Math.abs(min-targetMin);
-      if(!best || diff<best.diff){
-        best={diff, km, min, combo, dirResult};
-      }
-      if(diff<=allowedDiff) break; // 十分良ければ打ち切り
-    }catch(e){ /* このパターンは失敗、次へ */ }
-    await new Promise(r=>setTimeout(r,100));
-  }
-
-  if(!best){
-    return {selected:[], dirResult:null, km:targetMin/60*4.5, min:targetMin};
-  }
-  return {selected:best.combo, dirResult:best.dirResult, km:best.km, min:best.min};
 }
 
 async function loadDestSpots(){
@@ -1590,23 +1539,13 @@ async function loadRoute(){
 // Directions API: モードに応じて周回 or 目的地ルートを計算
 function calcDirections(){
   const origin={lat:S.lat,lng:S.lng};
-  let destination, waypoints;
-
-  if(S.mode==='random' && S.destPlace){
-    // おまかせモード：出発地→(寄り道)→目的地→出発地、という周回ルート
-    // 目的地を経由地の最後に含め、最終ゴールは出発地に戻す
-    destination = origin;
-    waypoints = [...S.selSpots, {lat:S.destPlace.lat, lng:S.destPlace.lng}];
-  } else if(S.destPlace){
-    // 目的地モード：目的地がゴール
-    destination = {lat:S.destPlace.lat, lng:S.destPlace.lng};
-    waypoints = S.selSpots;
+  let destination;
+  if(S.destPlace){
+    destination={lat:S.destPlace.lat,lng:S.destPlace.lng};
   } else {
-    destination = origin;
-    waypoints = S.selSpots;
+    destination=origin;
   }
-
-  return calcRoutesApi(origin, destination, waypoints);
+  return calcRoutesApi(origin, destination, S.selSpots);
 }
 
 function fetchElevation(dirResult){
@@ -1674,10 +1613,7 @@ function buildRouteData(dirResult, elevData){
   if(S.selSpots.length>0) chips.push({text:'スポット'+S.selSpots.length+'か所経由',type:'good'});
 
   let title, sub;
-  if(S.mode==='random' && S.destPlace){
-    title=S.destPlace.name+'を巡る周回さんぽ';
-    sub=S.selSpots.length>0?'寄り道'+S.selSpots.length+'か所・往復'+totalTime+'分':'往復'+totalTime+'分の周回ルート';
-  } else if(S.destPlace){
+  if(S.destPlace){
     title=S.destPlace.name+'へのおさんぽ';
     sub=S.selSpots.length>0?'寄り道'+S.selSpots.length+'か所を経由するルート':'最短ルート';
   } else {
@@ -1714,33 +1650,16 @@ function renderRoute(dirResult, elevData, routeData){
     <div class="stat-card"><div class="stat-icon">⛰️</div><div><div class="stat-val" style="font-size:16px">${elevTxt}</div><div class="stat-lbl">高低差</div></div></div>`;
 
   const legs=dirResult?dirResult.routes[0].legs:null;
-  const isRandomRoundTrip = S.mode==='random' && S.destPlace;
-
-  let wpts;
-  if(isRandomRoundTrip){
-    // おまかせモード：出発地→寄り道→目的地→出発地（周回）
-    wpts=[
-      {name:'🏠 現在地（出発）', meta:'スタート', color:'#1a7a4a'},
-      ...S.selSpots.map((sp,i)=>({
-        name:sp.emoji+' '+sp.name,
-        meta:legs&&legs[i]?`徒歩${Math.round(legs[i].duration.value/60)}分`:`経由地${i+1}`,
-        color:'#2563a8'
-      })),
-      {name:'📍 '+S.destPlace.name, meta:legs&&legs[S.selSpots.length]?`徒歩${Math.round(legs[S.selSpots.length].duration.value/60)}分`:'今日の行き先', color:'#d4620a'},
-      {name:'🏠 現在地（ゴール）', meta:`到着 合計${routeData.totalTime}分`, color:'#1a7a4a'}
-    ];
-  } else {
-    const destLabel = S.destPlace ? ('📍 '+S.destPlace.name+'（到着）') : '🏠 現在地（ゴール）';
-    wpts=[
-      {name:'🏠 現在地（出発）', meta:'スタート', color:'#1a7a4a'},
-      ...S.selSpots.map((sp,i)=>({
-        name:sp.emoji+' '+sp.name,
-        meta:legs&&legs[i]?`徒歩${Math.round(legs[i].duration.value/60)}分`:`経由地${i+1}`,
-        color:'#2563a8'
-      })),
-      {name:destLabel, meta:`到着 合計${routeData.totalTime}分`, color:'#d4620a'}
-    ];
-  }
+  const destLabel = S.destPlace ? ('📍 '+S.destPlace.name+'（到着）') : '🏠 現在地（ゴール）';
+  const wpts=[
+    {name:'🏠 現在地（出発）', meta:'スタート', color:'#1a7a4a'},
+    ...S.selSpots.map((sp,i)=>({
+      name:sp.emoji+' '+sp.name,
+      meta:legs&&legs[i]?`徒歩${Math.round(legs[i].duration.value/60)}分`:`経由地${i+1}`,
+      color:'#2563a8'
+    })),
+    {name:destLabel, meta:`到着 合計${routeData.totalTime}分`, color:'#d4620a'}
+  ];
   document.getElementById('route-waypoints').innerHTML=wpts.map((wp,i,a)=>`
     <div class="wp-row">
       <div class="wp-dotwrap"><div class="wp-dot" style="background:${wp.color}"></div>${i<a.length-1?'<div class="wp-line"></div>':''}</div>
@@ -1757,7 +1676,6 @@ function initGMap(dirResult){
   if(S.routeMarkers){ S.routeMarkers.forEach(m=>m.setMap(null)); }
   S.routeMarkers=[];
 
-  const isRandomRoundTrip = S.mode==='random' && S.destPlace;
   const destPt = S.destPlace ? {lat:S.destPlace.lat,lng:S.destPlace.lng} : {lat:S.lat,lng:S.lng};
   const centerLat=(S.lat+destPt.lat)/2, centerLng=(S.lng+destPt.lng)/2;
 
@@ -1767,20 +1685,8 @@ function initGMap(dirResult){
     zoomControl:true, gestureHandling:'cooperative'
   });
 
-  // マーカー配置：おまかせモードの周回は 出発地→寄り道→目的地→出発地（戻り）
-  let pts, colors;
-  if(isRandomRoundTrip){
-    pts=[
-      {lat:S.lat,lng:S.lng,title:'出発地'},
-      ...S.selSpots.map(sp=>({lat:sp.lat,lng:sp.lng,title:sp.name})),
-      {lat:destPt.lat,lng:destPt.lng,title:S.destPlace.name+'（行き先）'},
-      {lat:S.lat,lng:S.lng,title:'帰着'}
-    ];
-    colors=['#1a7a4a',...Array(S.selSpots.length).fill('#2563a8'),'#d4620a','#1a7a4a'];
-  } else {
-    pts=[{lat:S.lat,lng:S.lng,title:'出発地'},...S.selSpots.map(sp=>({lat:sp.lat,lng:sp.lng,title:sp.name})),{lat:destPt.lat,lng:destPt.lng,title:'ゴール'}];
-    colors=['#1a7a4a',...Array(S.selSpots.length).fill('#2563a8'),'#d4620a'];
-  }
+  const pts=[{lat:S.lat,lng:S.lng,title:'出発地'},...S.selSpots.map(sp=>({lat:sp.lat,lng:sp.lng,title:sp.name})),{lat:destPt.lat,lng:destPt.lng,title:'ゴール'}];
+  const colors=['#1a7a4a',...Array(S.selSpots.length).fill('#2563a8'),'#d4620a'];
   const bounds=new google.maps.LatLngBounds();
 
   // ルート線：Routes APIのポリラインがあればそれを使い、無ければ直線で代用
@@ -1812,17 +1718,8 @@ function regenRoute(){
 // ナビ起動 → 「散歩中」画面へ（まだ記録は確定しない）
 // ============================================================
 function buildNavUrl(){
-  const isRandomRoundTrip = S.mode==='random' && S.destPlace;
-  let destination, waypoints;
-
-  if(isRandomRoundTrip){
-    // 周回：出発地に戻ることをゴールにし、寄り道＋目的地を経由地にする
-    destination={lat:S.lat,lng:S.lng};
-    waypoints=[...S.selSpots, S.destPlace].map(sp=>`${sp.lat},${sp.lng}`).join('/');
-  } else {
-    destination = S.destPlace ? {lat:S.destPlace.lat,lng:S.destPlace.lng} : {lat:S.lat,lng:S.lng};
-    waypoints=S.selSpots.map(sp=>`${sp.lat},${sp.lng}`).join('/');
-  }
+  const destination = S.destPlace ? {lat:S.destPlace.lat,lng:S.destPlace.lng} : {lat:S.lat,lng:S.lng};
+  const waypoints=S.selSpots.map(sp=>`${sp.lat},${sp.lng}`).join('/');
 
   return `https://www.google.com/maps/dir/?api=1&origin=${S.lat},${S.lng}&destination=${destination.lat},${destination.lng}`
     + (waypoints ? `&waypoints=${encodeURIComponent(waypoints.replace(/\//g,'|'))}` : '')
