@@ -260,10 +260,14 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
 <div class="screen active" id="screen-home">
   <div class="status-bar"><span class="status-time" id="time-home">9:41</span><span class="status-dots">●●●</span></div>
   <div class="content">
-    <div class="home-header">
-      <div class="home-greeting" id="greeting">おはようございます</div>
-      <div class="home-title">今日も歩こう</div>
+    <div class="home-header" style="display:flex;align-items:flex-start;justify-content:space-between">
+      <div>
+        <div class="home-greeting" id="greeting">おはようございます</div>
+        <div class="home-title">今日も歩こう</div>
+      </div>
+      <button class="topnav-btn" onclick="promptEditNickname()" title="表示名を変更" style="margin-top:4px">⚙️</button>
     </div>
+    <div id="nickname-display" style="font-size:11px;color:var(--text-muted);font-weight:600;margin-top:-6px;margin-bottom:4px"></div>
 
     <div class="streak-card">
       <div class="streak-row">
@@ -279,6 +283,8 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
         <div class="streak-stat">総距離<b id="total-dist">0km</b></div>
       </div>
     </div>
+
+    <button class="btn-sub" style="margin-top:0" onclick="shareMyRecord()">📤 友達に記録をシェアする</button>
 
     <div class="section-lbl">どっちで歩く？</div>
     <div class="mode-grid">
@@ -297,6 +303,42 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
     <div class="section-lbl">さんぽ履歴</div>
     <div id="history-list"></div>
 
+    <div class="spacer"></div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 共有閲覧画面（友達のリンクを開いたときに表示） -->
+<!-- ============================================================ -->
+<div class="screen" id="screen-shared-view">
+  <div class="status-bar"><span class="status-time" id="time-shared">9:41</span><span class="status-dots">●●●</span></div>
+  <div class="topnav">
+    <button class="back-link" onclick="window.location.href=window.location.pathname">← 自分のホームへ</button>
+  </div>
+  <div class="content">
+    <div id="shared-loading" class="loading-box"><div class="spinner"></div><div class="ltxt">記録を読み込み中…</div></div>
+    <div id="shared-body" style="display:none">
+      <div class="home-title" id="shared-nickname" style="margin-bottom:14px"></div>
+
+      <div class="streak-card">
+        <div class="streak-row">
+          <div>
+            <div class="streak-num" id="shared-streak-num">0</div>
+            <div class="streak-label">日連続で散歩中</div>
+          </div>
+          <div class="streak-flame">🔥</div>
+        </div>
+        <div class="streak-stats">
+          <div class="streak-stat">合計<b id="shared-total-walks">0回</b></div>
+          <div class="streak-stat">訪問スポット<b id="shared-total-spots">0件</b></div>
+          <div class="streak-stat">総距離<b id="shared-total-km">0km</b></div>
+        </div>
+      </div>
+
+      <div class="section-lbl">最近のさんぽ</div>
+      <div id="shared-walk-list"></div>
+    </div>
+    <div id="shared-error" class="errbox" style="display:none"></div>
     <div class="spacer"></div>
   </div>
 </div>
@@ -585,6 +627,77 @@ const GMAPS_KEY = 'AIzaSyDzkmAOeCGFBWCISNvr_4FkaUyhzlJRX0A';
 })();
 
 // ============================================================
+// ★ ここにあなたのFirebase設定（firebaseConfig）を入れてください ★
+// Firebase Console → プロジェクトの設定 → マイアプリ → 設定（SDKの設定と構成）からコピー
+// 未設定の間はフレンド機能（共有）が動作しません（散歩アプリ本体はそのまま使えます）
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCD7Fqutz9k1AnnEo851LMlhR62rBmozMs",
+  authDomain: "tekuteku-7a287.firebaseapp.com",
+  projectId: "tekuteku-7a287",
+  storageBucket: "tekuteku-7a287.firebasestorage.app",
+  messagingSenderId: "427337289800",
+  appId: "1:427337289800:web:04a21d39be9b579a64887d"
+};
+
+let fbApp=null, fbDb=null, fbReady=false, fbReadyCbs=[];
+
+function whenFbReadyAsync(){ return new Promise(res=>{ if(fbReady) res(); else fbReadyCbs.push(res); }); }
+
+(function loadFirebaseSdk(){
+  if(FIREBASE_CONFIG.apiKey==='YOUR_FIREBASE_API_KEY'){
+    console.warn('Firebase未設定: フレンド機能（共有）はスキップされます');
+    return;
+  }
+  const s1=document.createElement('script');
+  s1.src='https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js';
+  s1.onload=()=>{
+    const s2=document.createElement('script');
+    s2.src='https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js';
+    s2.onload=()=>{
+      try{
+        fbApp=firebase.initializeApp(FIREBASE_CONFIG);
+        fbDb=firebase.firestore();
+        fbReady=true;
+        fbReadyCbs.forEach(cb=>cb());
+        fbReadyCbs=[];
+      }catch(e){ console.warn('Firebase初期化失敗:', e.message); }
+    };
+    document.head.appendChild(s2);
+  };
+  document.head.appendChild(s1);
+})();
+
+// ============================================================
+// ユーザーID（フレンド共有用。ログイン不要・ブラウザに固定IDを割り当てる）
+// ============================================================
+const USER_ID_KEY='tekuteku_user_id_v1';
+function getUserId(){
+  let id=localStorage.getItem(USER_ID_KEY);
+  if(!id){
+    id='u_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,10);
+    localStorage.setItem(USER_ID_KEY, id);
+  }
+  return id;
+}
+const MY_USER_ID = getUserId();
+
+// 表示用ニックネーム（未設定ならランダムな散歩っぽい名前を自動生成）
+const NICKNAME_KEY='tekuteku_nickname_v1';
+function getNickname(){
+  let n=localStorage.getItem(NICKNAME_KEY);
+  if(!n){
+    const adjectives=['のんびり','てくてく','ふらふら','すたすた','ぶらり'];
+    const animals=['ねこ','いぬ','うさぎ','くま','ぺんぎん'];
+    n=adjectives[Math.floor(Math.random()*adjectives.length)]+animals[Math.floor(Math.random()*animals.length)];
+    localStorage.setItem(NICKNAME_KEY, n);
+  }
+  return n;
+}
+function setNickname(n){
+  localStorage.setItem(NICKNAME_KEY, n);
+}
+
+// ============================================================
 // STORAGE（localStorage — ブラウザ内に保存。機種変更や別ブラウザでは引き継がれません）
 // ============================================================
 const STORAGE_KEY='tekuteku_data_v1';
@@ -704,6 +817,7 @@ function weekCount(){
 
 function renderHome(){
   document.getElementById('greeting').textContent=greetingText();
+  document.getElementById('nickname-display').textContent='👤 '+getNickname();
   const streak=calcStreak();
   document.getElementById('streak-num').textContent=streak;
   document.getElementById('week-count').textContent=weekCount()+'回';
@@ -752,7 +866,10 @@ getLoc().then(pos=>{ S.lat=pos.lat; S.lng=pos.lng; });
 // ============================================================
 // INIT
 // ============================================================
-window.addEventListener('DOMContentLoaded', renderHome);
+window.addEventListener('DOMContentLoaded', async ()=>{
+  const isShared = await checkAndShowSharedRecord();
+  if(!isShared) renderHome();
+});
 
 // ============================================================
 // A: おまかせ散歩モード — 時間設定画面
@@ -793,16 +910,25 @@ async function startRandomWalk(){
 // ============================================================
 // おまかせ散歩：8方向から「道のりが目標距離に近い」目的地候補を探す
 // ============================================================
-const DIRECTIONS_8=[
-  {deg:0,   label:'北',   icon:'⬆️'},
-  {deg:45,  label:'北東', icon:'↗️'},
-  {deg:90,  label:'東',   icon:'➡️'},
-  {deg:135, label:'南東', icon:'↘️'},
-  {deg:180, label:'南',   icon:'⬇️'},
-  {deg:225, label:'南西', icon:'↙️'},
-  {deg:270, label:'西',   icon:'⬅️'},
-  {deg:315, label:'北西', icon:'↖️'},
+const DIRECTIONS_16=[
+  {deg:0,    label:'北',    icon:'⬆️'},
+  {deg:22.5, label:'北北東', icon:'↗️'},
+  {deg:45,   label:'北東',  icon:'↗️'},
+  {deg:67.5, label:'東北東', icon:'➡️'},
+  {deg:90,   label:'東',    icon:'➡️'},
+  {deg:112.5,label:'東南東', icon:'↘️'},
+  {deg:135,  label:'南東',  icon:'↘️'},
+  {deg:157.5,label:'南南東', icon:'⬇️'},
+  {deg:180,  label:'南',    icon:'⬇️'},
+  {deg:202.5,label:'南南西', icon:'⬇️'},
+  {deg:225,  label:'南西',  icon:'↙️'},
+  {deg:247.5,label:'西南西', icon:'⬅️'},
+  {deg:270,  label:'西',    icon:'⬅️'},
+  {deg:292.5,label:'西北西', icon:'⬅️'},
+  {deg:315,  label:'北西',  icon:'↖️'},
+  {deg:337.5,label:'北北西', icon:'⬆️'},
 ];
+const DIRECTIONS_8=DIRECTIONS_16; // 互換用エイリアス（呼び出し側はそのまま動く）
 
 async function loadRandomDestinations(){
   show2('rand-dest-loading'); document.getElementById('rand-dest-results').innerHTML=''; hide2('rand-dest-error');
@@ -834,11 +960,10 @@ async function loadRandomDestinations(){
     await Promise.all(DIRECTIONS_8.map(async dir=>{
       // 探索の起点を目標よりやや手前（85%）にすることで、オーバーする候補が出にくいようにする
       const probe=pointAtBearing(S.lat, S.lng, dir.deg, targetKm*0.85);
-      // 1方向につき複数タイプを並行検索し、見つかったものをまとめて候補にする
+      // 1方向につき2タイプだけ検索（16方向に増やしたためAPI数を抑える）
       const typesToTry=[
         candidateTypes[Math.floor(Math.random()*candidateTypes.length)],
-        'tourist_attraction', // 観光・景勝地は常に試す（ヒット率が高いため）
-        'park'
+        'tourist_attraction' // 観光・景勝地は常に試す（ヒット率が高いため）
       ];
       const uniqueTypes=[...new Set(typesToTry)];
 
@@ -859,10 +984,10 @@ async function loadRandomDestinations(){
           lat:p.geometry.location.lat(), lng:p.geometry.location.lng(),
           rating:p.rating||null, types:p.types||[]
         })).sort((a,b)=>distKm(probe.lat,probe.lng,a.lat,a.lng)-distKm(probe.lat,probe.lng,b.lat,b.lng));
-        // 同じ方角から最大2件まで候補に入れる（選択肢を増やすため）
-        sorted.slice(0,2).forEach(s=>{
-          rawCandidates.push({...s, dirLabel:dir.label, dirIcon:dir.icon, dirDeg:dir.deg});
-        });
+        // 同じ方角からは1件のみ（16方向あるので方角ごとは絞り、全体の多様性を優先）
+        if(sorted[0]){
+          rawCandidates.push({...sorted[0], dirLabel:dir.label, dirIcon:dir.icon, dirDeg:dir.deg});
+        }
       }
     }));
 
@@ -870,6 +995,14 @@ async function loadRandomDestinations(){
     rawCandidates=rawCandidates.filter(c=>{ if(seen.has(c.place_id)) return false; seen.add(c.place_id); return true; });
 
     if(rawCandidates.length===0) throw new Error('周辺に候補地が見つかりませんでした。距離設定を変えてお試しください');
+
+    // 実測前に直線距離で大きく外れている候補を間引く（API呼び出し節約：16方向対応のため）
+    const targetKmLoose = targetKm; // 道のり換算前の直線目安
+    rawCandidates = rawCandidates
+      .map(c=>({...c, _straightKm: distKm(S.lat,S.lng,c.lat,c.lng)}))
+      .filter(c=>c._straightKm <= targetKmLoose*1.3) // 直線で大きく超えているものは実測するまでもなく除外
+      .sort((a,b)=>Math.abs(a._straightKm-targetKmLoose)-Math.abs(b._straightKm-targetKmLoose))
+      .slice(0,14); // 実測対象は最大14件に制限
 
     document.getElementById('rand-dest-loading-msg').textContent='片道時間を実測中…';
 
@@ -886,7 +1019,7 @@ async function loadRandomDestinations(){
         failReasons.push(e.message);
         console.warn('候補失敗:', c.name, e.message);
       }
-      await new Promise(r=>setTimeout(r,120));
+      await new Promise(r=>setTimeout(r,100));
     }
 
     if(measured.length===0){
@@ -910,7 +1043,7 @@ async function loadRandomDestinations(){
       return b.walkMin - a.walkMin; // 目標に近い（長め）順
     });
 
-    const filtered = underTarget.slice(0,6); // 最大6件表示（ガチャ演出用に少し多めに）
+    const filtered = underTarget.slice(0,8); // 最大8件表示（16方向探索に合わせて増量）
     const allowedDiff = Math.min(targetMin*0.2, 15); // カード表示の「ちょうどいい」判定用
 
     S.randDestCandidates=filtered;
@@ -1983,6 +2116,7 @@ function completeWalk(){
     spotCount: S.selSpots.length + (S.destPlace?1:0)
   });
   saveData();
+  syncToFirestore(); // フレンド共有用にクラウドへも同期（失敗してもアプリは止めない）
 
   // 完了画面表示
   const streak=calcStreak();
@@ -1997,6 +2131,137 @@ function completeWalk(){
   }
 
   goScreen('complete');
+}
+
+// ============================================================
+// フレンド機能：共有用URL（Firestoreへの同期・他人の記録の閲覧）
+// ============================================================
+
+// 自分の散歩データをFirestoreに同期（公開用の最小限の情報のみ）
+async function syncToFirestore(){
+  if(!fbReady){ console.warn('Firebase未準備のため同期スキップ'); return; }
+  try{
+    const streak=calcStreak();
+    const recentWalks=[...D.walks].reverse().slice(0,10).map(w=>({
+      date:w.date, mode:w.mode, title:w.title||'さんぽ',
+      km:w.km||0, min:w.min||0, spotCount:w.spotCount||0
+    }));
+    await fbDb.collection('walkers').doc(MY_USER_ID).set({
+      nickname:getNickname(),
+      streak,
+      totalSpots:Object.keys(D.visitedSpots).length,
+      totalWalks:D.walks.length,
+      totalKm: D.walks.reduce((s,w)=>s+(w.km||0),0),
+      recentWalks,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+  }catch(e){
+    console.warn('Firestore同期失敗:', e.message);
+  }
+}
+
+// 共有用URLを生成
+function buildShareUrl(){
+  const url=new URL(window.location.href);
+  url.search='';
+  url.searchParams.set('share', MY_USER_ID);
+  return url.toString();
+}
+
+// 共有ボタン押下時：URLをコピーしてユーザーに伝える
+async function shareMyRecord(){
+  if(!fbReady){
+    alert('共有機能の準備ができていません（しばらくしてからお試しください）');
+    return;
+  }
+  // 最新状態を同期してから共有
+  await syncToFirestore();
+  const url=buildShareUrl();
+  try{
+    await navigator.clipboard.writeText(url);
+    alert('共有用リンクをコピーしました！\n友達に送ってみましょう\n\n'+url);
+  }catch(e){
+    // クリップボードAPIが使えない場合はURLをそのまま表示
+    prompt('このリンクをコピーして友達に送ってください', url);
+  }
+}
+
+// URLに ?share=userId がある場合、その人の記録を読み取り専用で表示
+async function checkAndShowSharedRecord(){
+  const params=new URLSearchParams(window.location.search);
+  const sharedId=params.get('share');
+  if(!sharedId) return false;
+
+  if(sharedId===MY_USER_ID){
+    // 自分自身のリンクを開いた場合は通常のホームを表示
+    return false;
+  }
+
+  goScreen('shared-view');
+  await loadSharedRecord(sharedId);
+  return true;
+}
+
+async function loadSharedRecord(userId){
+  const loadingEl=document.getElementById('shared-loading');
+  const bodyEl=document.getElementById('shared-body');
+  const errEl=document.getElementById('shared-error');
+  if(loadingEl) loadingEl.style.display='flex';
+  if(bodyEl) bodyEl.style.display='none';
+  if(errEl) errEl.style.display='none';
+
+  try{
+    await whenFbReadyAsync();
+    const doc=await fbDb.collection('walkers').doc(userId).get();
+    if(!doc.exists){
+      throw new Error('この共有リンクの記録が見つかりませんでした');
+    }
+    const data=doc.data();
+    renderSharedRecord(data);
+    if(loadingEl) loadingEl.style.display='none';
+    if(bodyEl) bodyEl.style.display='block';
+  }catch(e){
+    if(loadingEl) loadingEl.style.display='none';
+    if(errEl){ errEl.style.display='block'; errEl.textContent='エラー: '+e.message; }
+  }
+}
+
+function renderSharedRecord(data){
+  document.getElementById('shared-nickname').textContent=(data.nickname||'てくてくユーザー')+'さんの記録';
+  document.getElementById('shared-streak-num').textContent=data.streak||0;
+  document.getElementById('shared-total-spots').textContent=(data.totalSpots||0)+'件';
+  document.getElementById('shared-total-walks').textContent=(data.totalWalks||0)+'回';
+  document.getElementById('shared-total-km').textContent=(data.totalKm||0).toFixed(1)+'km';
+
+  const listEl=document.getElementById('shared-walk-list');
+  const walks=data.recentWalks||[];
+  if(walks.length===0){
+    listEl.innerHTML='<div class="empty-state"><div class="ee">🚶</div><p>まだ散歩の記録がありません</p></div>';
+  } else {
+    listEl.innerHTML=walks.map(w=>{
+      const d=new Date(w.date);
+      const dateStr=(d.getMonth()+1)+'/'+d.getDate();
+      return `<div class="history-row">
+        <div class="history-icon">${w.mode==='destination'?'🎯':'🎲'}</div>
+        <div class="history-info">
+          <div class="history-name">${w.title}</div>
+          <div class="history-meta">${w.km?w.km.toFixed(1)+'km · ':''}${w.min||'-'}分 · スポット${w.spotCount||0}件</div>
+        </div>
+        <div class="history-date">${dateStr}</div>
+      </div>`;
+    }).join('');
+  }
+}
+
+// ニックネーム編集
+function promptEditNickname(){
+  const current=getNickname();
+  const next=prompt('表示名を入力してください（友達に表示されます）', current);
+  if(next && next.trim()){
+    setNickname(next.trim().slice(0,20));
+    renderHome();
+    syncToFirestore();
+  }
 }
 
 </script>
