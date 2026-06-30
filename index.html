@@ -285,11 +285,11 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
     <div style="font-size:20px;font-weight:900;margin-bottom:4px">🎲 おまかせ散歩</div>
     <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">未訪問スポットを優先して、今日のルートを提案します</div>
 
-    <div class="lbl mt18">何分歩けますか？</div>
+    <div class="lbl mt18">片道で何分歩けますか？</div>
     <div class="time-hero">
       <div class="num" id="time-num">20</div>
       <div class="unit">分</div>
-      <div class="sub" id="time-dist-est">往復で約1.5km</div>
+      <div class="sub" id="time-dist-est">片道 約1.5km</div>
     </div>
     <input type="range" id="time-range" min="5" max="60" step="5" value="20" oninput="onTimeChange(this.value)">
     <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:11px;color:var(--text-muted)"><span>5分</span><span>60分</span></div>
@@ -719,7 +719,7 @@ function onTimeChange(v){
   v=parseInt(v); S.timeMin=v;
   document.getElementById('time-num').textContent=v;
   const totalKm=(v/60*4.5).toFixed(1);
-  document.getElementById('time-dist-est').textContent='周回で約'+totalKm+'km（実測で調整します）';
+  document.getElementById('time-dist-est').textContent='片道 約'+totalKm+'km（実測で調整します）';
   document.getElementById('time-range').style.setProperty('--pct',((v-5)/55*100).toFixed(1)+'%');
   document.querySelectorAll('#screen-time-setup .preset-btn').forEach(b=>b.classList.remove('active'));
 }
@@ -778,12 +778,13 @@ async function loadRandomDestinations(){
     const candidateTypes=['park','train_station','tourist_attraction','cafe'];
 
     let rawCandidates=[];
+    const probeRadius=Math.max(300, Math.min(Math.round(targetKm*1000*0.3), 800));
     await Promise.all(DIRECTIONS_8.map(async dir=>{
       // 直線距離は道のりよりやや短くなる傾向があるので、目標よりやや遠めの仮地点を起点にする
       const probe=pointAtBearing(S.lat, S.lng, dir.deg, targetKm*1.15);
       const type=candidateTypes[Math.floor(Math.random()*candidateTypes.length)];
       const results=await new Promise(res=>{
-        svc.nearbySearch({location:probe, radius:600, type, language:'ja'},(r,status)=>{
+        svc.nearbySearch({location:probe, radius:probeRadius, type, language:'ja'},(r,status)=>{
           res(status===google.maps.places.PlacesServiceStatus.OK ? (r||[]) : []);
         });
       });
@@ -806,18 +807,26 @@ async function loadRandomDestinations(){
 
     document.getElementById('rand-dest-loading-msg').textContent='道のり距離を実測中…';
 
-    // 各候補をDirections APIで実測し、目標距離との差でフィルタ
+    // 各候補をDirections APIで実測（直列・間隔を空けてレート制限を回避）
     const measured=[];
+    const failReasons=[];
     for(const c of rawCandidates){
       try{
         const dirResult=await calcDirectionsFor({lat:S.lat,lng:S.lng}, {lat:c.lat,lng:c.lng}, [], false);
         const km=dirResult.routes[0].legs[0].distance.value/1000;
         const min=Math.round(dirResult.routes[0].legs[0].duration.value/60);
         measured.push({...c, walkKm:km, walkMin:min, diff:Math.abs(km-targetKm)});
-      }catch(e){ /* 失敗した候補はスキップ */ }
+      }catch(e){
+        failReasons.push(e.message);
+        console.warn('候補失敗:', c.name, e.message);
+      }
+      await new Promise(r=>setTimeout(r,120)); // レート制限回避の小休止
     }
 
-    if(measured.length===0) throw new Error('ルート計測に失敗しました。もう一度お試しください');
+    if(measured.length===0){
+      const reasonSummary = failReasons.length>0 ? failReasons[0] : '不明なエラー';
+      throw new Error('ルート計測に失敗しました（'+reasonSummary+'）。もう一度お試しください');
+    }
 
     // 目標距離±20%以内を優先、足りなければ近い順で補完
     let filtered=measured.filter(c=>c.diff<=targetKm*0.2);
@@ -855,7 +864,7 @@ function renderRandDestCandidates(candidates, targetKm){
         <div class="rdest-meta">
           <span class="rdest-dir">${c.dirLabel}方向</span>
           <span class="rdest-diff ${diffClass}">${diffLabel}</span>
-          <span>🚶 ${c.walkKm.toFixed(1)}km・${c.walkMin}分</span>
+          <span>🚶 片道 ${c.walkKm.toFixed(1)}km・${c.walkMin}分</span>
         </div>
       </div>`;
     card.onclick=()=>selectRandomDestination(c);
