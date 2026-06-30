@@ -781,25 +781,46 @@ async function loadRandomDestinations(){
 
     // 各方角で仮地点を計算し、その周辺でPlacesを検索
     const svc=new google.maps.places.PlacesService(document.createElement('div'));
-    const candidateTypes=['park','train_station','tourist_attraction','cafe'];
+    // カテゴリーを拡充：お店だけでなく寺社・景色も対象に（Places APIの正式typeのみ使用）
+    const candidateTypes=[
+      'park', 'train_station', 'tourist_attraction', 'cafe',
+      'place_of_worship', // 神社・お寺など寺社仏閣全般
+      'museum', 'art_gallery' // 文化施設
+    ];
 
     let rawCandidates=[];
-    const probeRadius=Math.max(300, Math.min(Math.round(targetKm*1000*0.3), 800));
+    const probeRadius=Math.max(400, Math.min(Math.round(targetKm*1000*0.4), 1000));
     await Promise.all(DIRECTIONS_8.map(async dir=>{
       const probe=pointAtBearing(S.lat, S.lng, dir.deg, targetKm*1.15);
-      const type=candidateTypes[Math.floor(Math.random()*candidateTypes.length)];
-      const results=await new Promise(res=>{
+      // 1方向につき複数タイプを並行検索し、見つかったものをまとめて候補にする
+      const typesToTry=[
+        candidateTypes[Math.floor(Math.random()*candidateTypes.length)],
+        'tourist_attraction', // 観光・景勝地は常に試す（ヒット率が高いため）
+        'park'
+      ];
+      const uniqueTypes=[...new Set(typesToTry)];
+
+      const allResults=[];
+      await Promise.all(uniqueTypes.map(type=>new Promise(res=>{
         svc.nearbySearch({location:probe, radius:probeRadius, type, language:'ja'},(r,status)=>{
-          res(status===google.maps.places.PlacesServiceStatus.OK ? (r||[]) : []);
+          if(status===google.maps.places.PlacesServiceStatus.OK) allResults.push(...(r||[]));
+          res();
         });
-      });
-      if(results.length>0){
-        const sorted=results.map(p=>({
+      })));
+
+      if(allResults.length>0){
+        // 重複除去してから一番近いものを選ぶ
+        const seenIds=new Set();
+        const dedup=allResults.filter(p=>{ if(seenIds.has(p.place_id)) return false; seenIds.add(p.place_id); return true; });
+        const sorted=dedup.map(p=>({
           place_id:p.place_id, name:p.name,
           lat:p.geometry.location.lat(), lng:p.geometry.location.lng(),
           rating:p.rating||null, types:p.types||[]
         })).sort((a,b)=>distKm(probe.lat,probe.lng,a.lat,a.lng)-distKm(probe.lat,probe.lng,b.lat,b.lng));
-        rawCandidates.push({...sorted[0], dirLabel:dir.label, dirIcon:dir.icon, dirDeg:dir.deg});
+        // 同じ方角から最大2件まで候補に入れる（選択肢を増やすため）
+        sorted.slice(0,2).forEach(s=>{
+          rawCandidates.push({...s, dirLabel:dir.label, dirIcon:dir.icon, dirDeg:dir.deg});
+        });
       }
     }));
 
@@ -818,7 +839,7 @@ async function loadRandomDestinations(){
         const goResult=await calcDirectionsFor({lat:S.lat,lng:S.lng}, {lat:c.lat,lng:c.lng}, [], false);
         const goMin = goResult.routes[0].legs.reduce((s,l)=>s+l.duration.value,0)/60;
         const goKm = goResult.routes[0].legs.reduce((s,l)=>s+l.distance.value,0)/1000;
-        measured.push({...c, walkKm:goKm, walkMin:Math.round(goMin), diff:Math.abs(goMin-targetMin)});
+        measured.push({...c, walkKm:goKm, walkMin:Math.round(goMin), diff:Math.abs(goMin-targetMin), visited:isVisited(c.place_id)});
       }catch(e){
         failReasons.push(e.message);
         console.warn('候補失敗:', c.name, e.message);
@@ -831,18 +852,17 @@ async function loadRandomDestinations(){
       throw new Error('ルート計測に失敗しました（'+reasonSummary+'）。もう一度お試しください');
     }
 
-    // 許容誤差：設定時間の15%、ただし最大15分
-    const allowedDiff = Math.min(targetMin*0.15, 15);
-    // 緩和許容誤差：どうしても候補が足りない場合のみ、誤差30%までは許容（無制限の妥協はしない）
-    const relaxedDiff = targetMin*0.3;
-
+    // 許容誤差：設定時間の20%、ただし最大15分（少し緩和）
+    const allowedDiff = Math.min(targetMin*0.2, 15);
+    // 段階的に緩和：それでも足りなければ50%まで許容、それでもダメなら無条件で一番近い候補を出す
     let filtered=measured.filter(c=>c.diff<=allowedDiff);
     if(filtered.length<3){
-      const relaxed=measured.filter(c=>c.diff<=relaxedDiff).sort((a,b)=>a.diff-b.diff);
+      const relaxed=measured.filter(c=>c.diff<=targetMin*0.5).sort((a,b)=>a.diff-b.diff);
       filtered=relaxed.slice(0, Math.max(3, filtered.length));
     }
     if(filtered.length===0){
-      throw new Error(`設定時間（片道${targetMin}分）に近い行き先が見つかりませんでした。時間を変えてお試しください`);
+      // 最終手段：誤差を問わず一番近い候補を最大4件出す（見つからないよりはマシ）
+      filtered=[...measured].sort((a,b)=>a.diff-b.diff).slice(0,4);
     }
     filtered.sort((a,b)=>a.diff-b.diff);
 
@@ -867,6 +887,7 @@ function renderRandDestCandidates(candidates, targetMin, allowedDiff){
     const card=document.createElement('div'); card.className='rdest-card';
     const diffClass=c.diff<=allowedDiff?'ok':'far';
     const diffLabel=c.diff<=allowedDiff?'ちょうどいい':`目標と${Math.round(c.diff)}分差`;
+    const visitedBadge=c.visited?'<span style="font-size:10px;padding:2px 7px;border-radius:5px;background:var(--gray-2);color:var(--text-muted);font-weight:700">前にも訪問</span>':'';
     card.innerHTML=`
       <div class="rdest-compass">${c.dirIcon}</div>
       <div class="rdest-info">
@@ -874,6 +895,7 @@ function renderRandDestCandidates(candidates, targetMin, allowedDiff){
         <div class="rdest-meta">
           <span class="rdest-dir">${c.dirLabel}方向</span>
           <span class="rdest-diff ${diffClass}">${diffLabel}</span>
+          ${visitedBadge}
           <span>🚶 片道 ${c.walkKm.toFixed(1)}km・${c.walkMin}分</span>
         </div>
       </div>`;
