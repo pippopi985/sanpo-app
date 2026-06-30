@@ -580,7 +580,7 @@ const S={
   // ルート
   route:null,
   // map
-  gmap:null, directionsRenderer:null,
+  gmap:null, routePolyline:null, routeMarkers:[],
   mapsReady:false, mapsReadyCbs:[]
 };
 let prevSpotScreen='home';
@@ -1047,20 +1047,93 @@ async function findBestSpotCombo(candidates, targetKm, destPlace){
   return {selected:best.combo, candidatesShown:candidates, dirResult:best.dirResult, km:best.km};
 }
 
+// ============================================================
+// Routes API（新版）を使ったルート計算
+// 戻り値は旧DirectionsServiceの結果と互換性のある形に変換して返す
+// （呼び出し側のコードを変更せずに済むようにするため）
+// ============================================================
 function calcDirectionsFor(origin, destination, spots, isLoop){
-  return new Promise((res,rej)=>{
-    const svc=new google.maps.DirectionsService();
-    const waypoints=spots.map(sp=>({location:{lat:sp.lat,lng:sp.lng}, stopover:true}));
-    svc.route({
-      origin, destination, waypoints,
-      travelMode:google.maps.TravelMode.WALKING,
-      optimizeWaypoints:true,
-      language:'ja'
-    },(result,status)=>{
-      if(status==='OK') res(result);
-      else rej(new Error('Directions API: '+status));
-    });
+  return calcRoutesApi(origin, destination, spots);
+}
+
+async function calcRoutesApi(origin, destination, spots){
+  const intermediates = spots.map(sp=>({location:{latLng:{latitude:sp.lat, longitude:sp.lng}}}));
+
+  const body={
+    origin:{location:{latLng:{latitude:origin.lat, longitude:origin.lng}}},
+    destination:{location:{latLng:{latitude:destination.lat, longitude:destination.lng}}},
+    intermediates,
+    travelMode:'WALK',
+    optimizeWaypointOrder: intermediates.length>0,
+    languageCode:'ja',
+    units:'METRIC'
+  };
+
+  const res=await fetch('https://routes.googleapis.com/directions/v2:computeRoutes',{
+    method:'POST',
+    headers:{
+      'Content-Type':'application/json',
+      'X-Goog-Api-Key': GMAPS_KEY,
+      'X-Goog-FieldMask':'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs,routes.optimizedIntermediateWaypointIndex'
+    },
+    body:JSON.stringify(body)
   });
+
+  if(!res.ok){
+    const errText=await res.text().catch(()=>res.statusText);
+    throw new Error('Routes API: '+res.status+' '+errText.slice(0,150));
+  }
+  const data=await res.json();
+  if(!data.routes || data.routes.length===0) throw new Error('Routes API: ルートが見つかりませんでした');
+
+  return routesApiToDirectionsShape(data.routes[0], origin, destination, spots);
+}
+
+// Routes APIのレスポンスを、既存コードが期待する「DirectionsResult」風の形に変換
+function routesApiToDirectionsShape(route, origin, destination, spots){
+  const legs = (route.legs||[]).map(leg=>({
+    distance:{ value: leg.distanceMeters || 0 },
+    duration:{ value: parseDurationSeconds(leg.duration) }
+  }));
+
+  // legsが無い/不完全な場合のフォールバック（全体のdistance/durationを1区間として扱う）
+  const totalDistance = route.distanceMeters || legs.reduce((s,l)=>s+l.distance.value,0);
+  const totalDuration = parseDurationSeconds(route.duration) || legs.reduce((s,l)=>s+l.duration.value,0);
+  const safeLegs = legs.length>0 ? legs : [{distance:{value:totalDistance}, duration:{value:totalDuration}}];
+
+  // overview_path: ポリラインをデコードした座標配列（地図描画・高低差取得で使用）
+  const overviewPath = route.polyline?.encodedPolyline ? decodePolyline(route.polyline.encodedPolyline) : [origin, destination];
+
+  return {
+    routes:[{
+      legs: safeLegs,
+      _rawOverviewPath: overviewPath // {lat, lng}の配列
+    }]
+  };
+}
+
+function parseDurationSeconds(durationStr){
+  // Routes APIのdurationは "1234s" 形式の文字列
+  if(!durationStr) return 0;
+  const m=String(durationStr).match(/(\d+)s/);
+  return m ? parseInt(m[1]) : 0;
+}
+
+// Google製ポリラインエンコーディングのデコーダー（標準アルゴリズム）
+function decodePolyline(encoded){
+  let points=[], index=0, lat=0, lng=0;
+  while(index < encoded.length){
+    let b, shift=0, result=0;
+    do{ b=encoded.charCodeAt(index++)-63; result|=(b&0x1f)<<shift; shift+=5; }while(b>=0x20);
+    const dlat=(result&1)?~(result>>1):(result>>1);
+    lat+=dlat;
+    shift=0; result=0;
+    do{ b=encoded.charCodeAt(index++)-63; result|=(b&0x1f)<<shift; shift+=5; }while(b>=0x20);
+    const dlng=(result&1)?~(result>>1):(result>>1);
+    lng+=dlng;
+    points.push({lat: lat/1e5, lng: lng/1e5});
+  }
+  return points;
 }
 
 function enrichSpotsLocal(spots){
@@ -1375,37 +1448,28 @@ async function loadRoute(){
 
 // Directions API: モードに応じて周回 or 目的地ルートを計算
 function calcDirections(){
-  return new Promise((res,rej)=>{
-    const svc=new google.maps.DirectionsService();
-    const origin={lat:S.lat,lng:S.lng};
-    let destination;
-    if(S.destPlace){
-      destination={lat:S.destPlace.lat,lng:S.destPlace.lng};
-    } else {
-      // おまかせモード：周回ルート（出発地に戻る）
-      destination=origin;
-    }
-    const waypoints=S.selSpots.map(sp=>({location:{lat:sp.lat,lng:sp.lng}, stopover:true}));
-    svc.route({
-      origin, destination, waypoints,
-      travelMode:google.maps.TravelMode.WALKING,
-      optimizeWaypoints: true, // 目的地ありなら常に最適順で経由地を回る
-      language:'ja'
-    },(result,status)=>{
-      if(status==='OK') res(result);
-      else rej(new Error('Directions API: '+status));
-    });
-  });
+  const origin={lat:S.lat,lng:S.lng};
+  let destination;
+  if(S.destPlace){
+    destination={lat:S.destPlace.lat,lng:S.destPlace.lng};
+  } else {
+    // おまかせモード：周回ルート（出発地に戻る）
+    destination=origin;
+  }
+  return calcRoutesApi(origin, destination, S.selSpots);
 }
 
 function fetchElevation(dirResult){
   return new Promise((res)=>{
     const elev=new google.maps.ElevationService();
-    const path=dirResult.routes[0].overview_path;
-    const samples=Math.min(path.length, 30);
+    const rawPath = dirResult.routes[0]._rawOverviewPath || [];
+    const samples=Math.min(rawPath.length, 30);
     if(samples<2){ res({up:null,down:null,maxSlope:null}); return; }
     const points=[];
-    for(let i=0;i<samples;i++) points.push(path[Math.floor(i*path.length/samples)]);
+    for(let i=0;i<samples;i++){
+      const p=rawPath[Math.floor(i*rawPath.length/samples)];
+      points.push(new google.maps.LatLng(p.lat, p.lng));
+    }
     elev.getElevationAlongPath({path:points,samples},(results,status)=>{
       if(status==='OK'){
         let up=0,down=0,prev=null,maxSlope=0;
@@ -1519,7 +1583,10 @@ function renderRoute(dirResult, elevData, routeData){
 }
 
 function initGMap(dirResult){
-  if(S.gmap && S.directionsRenderer){ S.directionsRenderer.setMap(null); S.directionsRenderer=null; }
+  if(S.gmap && S.routePolyline){ S.routePolyline.setMap(null); S.routePolyline=null; }
+  if(S.routeMarkers){ S.routeMarkers.forEach(m=>m.setMap(null)); }
+  S.routeMarkers=[];
+
   const destPt = S.destPlace ? {lat:S.destPlace.lat,lng:S.destPlace.lng} : {lat:S.lat,lng:S.lng};
   const centerLat=(S.lat+destPt.lat)/2, centerLng=(S.lng+destPt.lng)/2;
 
@@ -1529,25 +1596,29 @@ function initGMap(dirResult){
     zoomControl:true, gestureHandling:'cooperative'
   });
 
-  if(dirResult){
-    S.directionsRenderer=new google.maps.DirectionsRenderer({
-      map:S.gmap,
-      polylineOptions:{strokeColor:'#1a7a4a',strokeWeight:5,strokeOpacity:.85},
-      suppressMarkers:false
-    });
-    S.directionsRenderer.setDirections(dirResult);
-  } else {
-    const pts=[{lat:S.lat,lng:S.lng,title:'出発地'},...S.selSpots.map(sp=>({lat:sp.lat,lng:sp.lng,title:sp.name})),{lat:destPt.lat,lng:destPt.lng,title:'ゴール'}];
-    new google.maps.Polyline({path:pts.map(p=>({lat:p.lat,lng:p.lng})),geodesic:true,strokeColor:'#1a7a4a',strokeOpacity:.8,strokeWeight:4,map:S.gmap});
-    const bounds=new google.maps.LatLngBounds();
-    const colors=['#1a7a4a',...Array(S.selSpots.length).fill('#2563a8'),'#d4620a'];
-    pts.forEach((p,i)=>{
-      bounds.extend({lat:p.lat,lng:p.lng});
-      new google.maps.Marker({position:{lat:p.lat,lng:p.lng},map:S.gmap,title:p.title,
-        icon:{path:google.maps.SymbolPath.CIRCLE,scale:8,fillColor:colors[i],fillOpacity:1,strokeColor:'#fff',strokeWeight:2}});
-    });
-    S.gmap.fitBounds(bounds,{padding:30});
-  }
+  const pts=[{lat:S.lat,lng:S.lng,title:'出発地'},...S.selSpots.map(sp=>({lat:sp.lat,lng:sp.lng,title:sp.name})),{lat:destPt.lat,lng:destPt.lng,title:'ゴール'}];
+  const colors=['#1a7a4a',...Array(S.selSpots.length).fill('#2563a8'),'#d4620a'];
+  const bounds=new google.maps.LatLngBounds();
+
+  // ルート線：Routes APIのポリラインがあればそれを使い、無ければ直線で代用
+  const pathCoords = (dirResult && dirResult.routes[0]._rawOverviewPath)
+    ? dirResult.routes[0]._rawOverviewPath
+    : pts.map(p=>({lat:p.lat,lng:p.lng}));
+
+  S.routePolyline=new google.maps.Polyline({
+    path: pathCoords,
+    geodesic:true, strokeColor:'#1a7a4a', strokeOpacity:.85, strokeWeight:5,
+    map:S.gmap
+  });
+
+  pts.forEach((p,i)=>{
+    bounds.extend({lat:p.lat,lng:p.lng});
+    const marker=new google.maps.Marker({position:{lat:p.lat,lng:p.lng},map:S.gmap,title:p.title,
+      icon:{path:google.maps.SymbolPath.CIRCLE,scale:8,fillColor:colors[i],fillOpacity:1,strokeColor:'#fff',strokeWeight:2}});
+    S.routeMarkers.push(marker);
+  });
+  pathCoords.forEach(c=>bounds.extend(c));
+  S.gmap.fitBounds(bounds,{padding:30});
 }
 
 function regenRoute(){
