@@ -315,6 +315,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
       <button onclick="requestNotifPermission()" style="padding:8px 13px;border-radius:10px;border:none;background:var(--green);color:#fff;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap">許可する</button>
     </div>
 
+    <!-- 通知が届いた時刻 -->
+    <div id="last-notif-time" style="display:none;font-size:11px;color:var(--text-muted);font-weight:600;margin:-8px 0 8px;text-align:center"></div>
+
     <div class="section-lbl">どっちで歩く？</div>
     <div class="mode-grid">
       <div class="mode-card" onclick="goScreen('time-setup')">
@@ -588,27 +591,30 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
 <!-- ============================================================ -->
 <div class="screen" id="screen-walking">
   <div class="status-bar"><span class="status-time" id="time-7">9:41</span><span class="status-dots">●●●</span></div>
-  <div class="topnav">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 14px 4px;flex-shrink:0;background:#fff;border-bottom:1px solid var(--gray-2)">
     <button class="back-link" onclick="goScreen('route')">← ルートに戻る</button>
+    <div id="walking-sub" style="font-size:11px;color:var(--text-muted);font-weight:600;text-align:right"></div>
   </div>
-  <div class="content">
-    <div style="text-align:center;padding:50px 10px 20px">
-      <div style="font-size:64px;margin-bottom:16px">🚶</div>
-      <div style="font-size:20px;font-weight:900;color:var(--text)">散歩中…</div>
-      <div style="font-size:13px;color:var(--text-muted);margin-top:8px;font-weight:600" id="walking-sub"></div>
+
+  <!-- アプリ内ナビ：Googleマップ埋め込みiframe -->
+  <div style="flex:1;position:relative;overflow:hidden">
+    <iframe id="walking-map-iframe"
+      style="width:100%;height:100%;border:none"
+      allowfullscreen
+      loading="lazy"
+      referrerpolicy="no-referrer-when-downgrade">
+    </iframe>
+    <!-- 地図が読み込まれるまでのプレースホルダー -->
+    <div id="walking-map-placeholder" style="position:absolute;inset:0;background:var(--gray-1);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px">
+      <div class="spinner"></div>
+      <div style="font-size:13px;color:var(--text-muted);font-weight:600">ナビを読み込み中…</div>
     </div>
-
-    <div class="stat-grid" id="walking-stats" style="margin-top:10px"></div>
-
-    <div class="tip-box tip-good" style="margin-top:6px">
-      <span>🗺️</span><span>Googleマップでナビが開いています。終わったら下のボタンで記録しましょう</span>
-    </div>
-
-    <div class="spacer"></div>
   </div>
-  <div class="bottom-bar">
+
+  <!-- 下部：ステータス + ボタン -->
+  <div style="background:#fff;border-top:1px solid var(--gray-2);padding:10px 14px;padding-bottom:calc(10px + env(safe-area-inset-bottom));flex-shrink:0">
+    <div class="stat-grid" id="walking-stats" style="margin-bottom:10px"></div>
     <button class="btn-main" onclick="completeWalk()">✅ 散歩を完了する</button>
-    <button class="btn-sub" onclick="reopenNav()">🧭 もう一度ナビを開く</button>
   </div>
 </div>
 
@@ -2107,22 +2113,101 @@ function buildNavUrl(){
     + `&travelmode=walking`;
 }
 
-function startWalking(){
-  // Googleマップでナビを開く
-  window.open(buildNavUrl(), '_blank');
+function buildEmbedNavUrl(){
+  // アプリ内埋め込み用：Google Maps Embed API（ナビモード）
+  const destination = S.destPlace ? {lat:S.destPlace.lat,lng:S.destPlace.lng} : {lat:S.lat,lng:S.lng};
+  const waypointStr = S.selSpots.map(sp=>`${sp.lat},${sp.lng}`).join('|');
 
-  // 「散歩中」画面に表示する情報を準備
+  // Directionsモードの埋め込みURL
+  let url = `https://www.google.com/maps/embed/v1/directions?key=${GMAPS_KEY}`
+    + `&origin=${S.lat},${S.lng}`
+    + `&destination=${destination.lat},${destination.lng}`
+    + `&mode=walking`
+    + `&language=ja`;
+  if(waypointStr) url += `&waypoints=${encodeURIComponent(waypointStr)}`;
+  return url;
+}
+
+// GPS距離計測用の状態
+let gpsWatchId = null;
+let gpsLastPos = null;
+let gpsTrackedKm = 0;
+let gpsElapsedTimer = null;
+let gpsStartTime = null;
+
+// Haversine公式で2点間の距離(km)を計算
+function haversineKm(lat1,lng1,lat2,lng2){
+  const R=6371, dLat=(lat2-lat1)*Math.PI/180, dLng=(lng2-lng1)*Math.PI/180;
+  const a=Math.sin(dLat/2)**2+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLng/2)**2;
+  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+
+function startGPSTracking(){
+  if(!navigator.geolocation) return;
+  gpsTrackedKm=0; gpsLastPos=null; gpsStartTime=Date.now();
+  gpsWatchId=navigator.geolocation.watchPosition(
+    pos=>{
+      const {latitude:lat,longitude:lng}=pos.coords;
+      if(gpsLastPos){
+        const d=haversineKm(gpsLastPos.lat,gpsLastPos.lng,lat,lng);
+        if(d>=0.005 && d<0.5) gpsTrackedKm+=d; // 5m以上500m以下の移動のみ計測（GPS誤差除去）
+      }
+      gpsLastPos={lat,lng};
+      updateWalkingStats();
+    },
+    err=>console.warn('GPS誤差:', err.message),
+    {enableHighAccuracy:true, maximumAge:3000, timeout:10000}
+  );
+  // 経過時間を1分ごとに更新
+  gpsElapsedTimer=setInterval(updateWalkingStats, 30000);
+}
+
+function stopGPSTracking(){
+  if(gpsWatchId!==null){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId=null; }
+  if(gpsElapsedTimer){ clearInterval(gpsElapsedTimer); gpsElapsedTimer=null; }
+}
+
+function updateWalkingStats(){
+  const statsEl=document.getElementById('walking-stats');
+  if(!statsEl) return;
+  const elapsedMin=gpsStartTime ? Math.round((Date.now()-gpsStartTime)/60000) : 0;
+  const km=gpsTrackedKm.toFixed(2);
+  // 歩数は距離から概算（平均歩幅70cm）
+  const steps=Math.round(gpsTrackedKm*1000/0.7);
+  const kcal=Math.round(gpsTrackedKm*60);
+  statsEl.innerHTML=`
+    <div class="stat-card"><div class="stat-icon">🗺️</div><div><div class="stat-val">${km}</div><div class="stat-lbl">km（GPS実測）</div></div></div>
+    <div class="stat-card"><div class="stat-icon">⏱️</div><div><div class="stat-val">${elapsedMin}</div><div class="stat-lbl">分経過</div></div></div>
+    <div class="stat-card"><div class="stat-icon">👟</div><div><div class="stat-val">${steps>=1000?(steps/1000).toFixed(1)+'k':steps}</div><div class="stat-lbl">歩（概算）</div></div></div>
+    <div class="stat-card"><div class="stat-icon">🔥</div><div><div class="stat-val">${kcal}</div><div class="stat-lbl">kcal</div></div></div>`;
+}
+
+function startWalking(){
   const rd=S.route.routeData;
-  document.getElementById('walking-sub').textContent = rd.title + '・' + rd.totalDist + 'km・約' + rd.totalTime + '分';
-  document.getElementById('walking-stats').innerHTML = `
-    <div class="stat-card"><div class="stat-icon">🗺️</div><div><div class="stat-val">${rd.totalDist}</div><div class="stat-lbl">km</div></div></div>
-    <div class="stat-card"><div class="stat-icon">⏱️</div><div><div class="stat-val">${rd.totalTime}</div><div class="stat-lbl">分</div></div></div>`;
+  document.getElementById('walking-sub').textContent = rd.title + '・ルート' + rd.totalDist + 'km・約' + rd.totalTime + '分';
+
+  // 初期表示（GPS計測前）
+  document.getElementById('walking-stats').innerHTML=`
+    <div class="stat-card"><div class="stat-icon">🗺️</div><div><div class="stat-val">0.00</div><div class="stat-lbl">km（GPS実測）</div></div></div>
+    <div class="stat-card"><div class="stat-icon">⏱️</div><div><div class="stat-val">0</div><div class="stat-lbl">分経過</div></div></div>
+    <div class="stat-card"><div class="stat-icon">👟</div><div><div class="stat-val">0</div><div class="stat-lbl">歩（概算）</div></div></div>
+    <div class="stat-card"><div class="stat-icon">🔥</div><div><div class="stat-val">0</div><div class="stat-lbl">kcal</div></div></div>`;
+
+  // iframeにGoogleマップナビを埋め込む
+  const iframe = document.getElementById('walking-map-iframe');
+  const placeholder = document.getElementById('walking-map-placeholder');
+  if(iframe){
+    iframe.src = buildEmbedNavUrl();
+    iframe.onload = ()=>{ if(placeholder) placeholder.style.display='none'; };
+  }
 
   S.walkStartedAt = Date.now();
+  startGPSTracking(); // GPS計測開始
   goScreen('walking');
 }
 
 function reopenNav(){
+  // 外部Googleマップでのナビも念のため残す
   window.open(buildNavUrl(), '_blank');
 }
 
@@ -2130,6 +2215,12 @@ function reopenNav(){
 // 散歩完了処理
 // ============================================================
 function completeWalk(){
+  // GPS計測を停止
+  stopGPSTracking();
+  const actualKm = gpsTrackedKm > 0 ? gpsTrackedKm : null;
+  const actualMin = gpsStartTime ? Math.round((Date.now()-gpsStartTime)/60000) : null;
+  const actualSteps = actualKm ? Math.round(actualKm*1000/0.7) : null;
+
   const rd=S.route.routeData;
   const today=new Date().toISOString().slice(0,10);
 
@@ -2144,21 +2235,26 @@ function completeWalk(){
     D.visitedSpots[S.destPlace.id]={name:S.destPlace.name, firstVisit:D.visitedSpots[S.destPlace.id]?D.visitedSpots[S.destPlace.id].firstVisit:today, lastVisit:today};
   }
 
-  // 散歩記録を追加
+  // 散歩記録を追加（GPS実測値があればそちらを優先）
+  const recordKm = actualKm || parseFloat(rd.totalDist);
+  const recordMin = actualMin || rd.totalTime;
   D.walks.push({
     date: today,
     mode: S.mode,
     title: rd.title,
-    km: parseFloat(rd.totalDist),
-    min: rd.totalTime,
+    km: parseFloat(recordKm.toFixed(2)),
+    min: recordMin,
+    steps: actualSteps,
     spotCount: S.selSpots.length + (S.destPlace?1:0)
   });
   saveData();
-  syncToFirestore(); // フレンド共有用にクラウドへも同期（失敗してもアプリは止めない）
+  syncToFirestore();
 
   // 完了画面表示
   const streak=calcStreak();
-  document.getElementById('complete-summary').textContent=rd.totalDist+'km・'+rd.totalTime+'分のさんぽ、お疲れさまでした';
+  const distLabel = actualKm ? `GPS実測 ${actualKm.toFixed(2)}km` : rd.totalDist+'km';
+  const stepsLabel = actualSteps ? `・約${actualSteps>=1000?(actualSteps/1000).toFixed(1)+'k':actualSteps}歩` : '';
+  document.getElementById('complete-summary').textContent=`${distLabel}${stepsLabel}・${recordMin}分のさんぽ、お疲れさまでした`;
   document.getElementById('complete-streak-num').textContent=streak;
 
   const newArea=document.getElementById('new-spots-area');
@@ -2212,15 +2308,25 @@ async function shareMyRecord(){
     alert('共有機能の準備ができていません（しばらくしてからお試しください）');
     return;
   }
-  // 最新状態を同期してから共有
-  await syncToFirestore();
   const url=buildShareUrl();
+
+  // クリップボードへのコピーは必ずユーザー操作の直後に行う（非同期処理の前に）
+  let copied=false;
   try{
     await navigator.clipboard.writeText(url);
-    alert('共有用リンクをコピーしました！\n友達に送ってみましょう\n\n'+url);
+    copied=true;
   }catch(e){
-    // クリップボードAPIが使えない場合はURLをそのまま表示
-    prompt('このリンクをコピーして友達に送ってください', url);
+    // クリップボードAPIが使えない場合は後でpromptで表示
+  }
+
+  // バックグラウンドでFirestoreに同期（コピー後なのでコンテキスト切れの影響なし）
+  syncToFirestore().catch(e=>console.warn('同期失敗:', e.message));
+
+  if(copied){
+    alert('✅ リンクをコピーしました！\n友達に送ってみましょう😊\n\n'+url);
+  } else {
+    // コピー失敗時はURLを選択しやすい形で表示
+    prompt('このリンクを長押しでコピーして友達に送ってください', url);
   }
 }
 
@@ -2452,21 +2558,47 @@ function showTodayMission(){
   const subEl = document.getElementById('mission-sub');
   if(!card || !textEl) return;
 
+  const today = new Date().toISOString().slice(0,10);
+
   // 今日すでに撮影済みかチェック
   const saved = localStorage.getItem(MISSION_KEY);
   if(saved){
     try{
       const s = JSON.parse(saved);
-      if(s.date === new Date().toISOString().slice(0,10) && s.done){
-        card.style.display = 'none'; // 今日はクリア済み
+      if(s.date === today && s.done){
+        // クリア済み → 写真付きで完了カードを表示
+        card.style.display = 'block';
+        card.style.background = 'linear-gradient(135deg,#1a7a4a 0%,#0f5c35 100%)';
+        if(s.photoUrl && s.photoUrl.startsWith('http')){
+          card.innerHTML = `
+            <div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px">✅ 今日のお題クリア！</div>
+            <img src="${s.photoUrl}" style="width:100%;border-radius:10px;max-height:200px;object-fit:cover;margin-bottom:8px">
+            <div style="font-size:11px;color:rgba(255,255,255,.8)">友達の共有ページにも表示されます 📤</div>
+          `;
+        } else {
+          card.innerHTML = `
+            <div style="font-size:20px;font-weight:900;color:#fff;margin-bottom:6px">✅ 今日のお題クリア！</div>
+            <div style="font-size:12px;color:rgba(255,255,255,.8)">明日もお題が届きます</div>
+          `;
+        }
         return;
       }
     }catch(e){}
   }
 
+  // 未撮影 → お題カードを表示
   const mission = getTodayMissionData();
-  textEl.textContent = mission.text;
-  subEl.textContent = mission.sub;
+  card.style.background = 'linear-gradient(135deg,#2563a8 0%,#1a4a8a 100%)';
+  card.innerHTML = `
+    <div style="position:absolute;right:-20px;top:-20px;font-size:80px;opacity:.15">📸</div>
+    <div style="font-size:11px;font-weight:700;opacity:.85;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">📸 今日のお題</div>
+    <div id="mission-text" style="font-size:20px;font-weight:900;line-height:1.3;margin-bottom:10px">${mission.text}</div>
+    <div id="mission-sub" style="font-size:12px;opacity:.85;margin-bottom:12px">${mission.sub}</div>
+    <div style="display:flex;gap:8px">
+      <button onclick="openCameraForMission()" style="flex:1;padding:10px;border-radius:10px;border:none;background:rgba(255,255,255,.2);color:#fff;font-size:13px;font-weight:700;cursor:pointer">📷 写真を撮る</button>
+      <button onclick="dismissMission()" style="padding:10px 14px;border-radius:10px;border:none;background:rgba(255,255,255,.1);color:#fff;font-size:12px;cursor:pointer">後で</button>
+    </div>
+  `;
   card.style.display = 'block';
 }
 
@@ -2581,10 +2713,35 @@ async function initPWA(){
   // 通知タップでアプリを開いた場合（?openMission=1 パラメータ）
   const params = new URLSearchParams(window.location.search);
   if(params.get('openMission')){
+    // 通知受信時刻を記録
+    const notifTime = new Date().toISOString();
+    localStorage.setItem('tekuteku_last_notif', notifTime);
     showTodayMission();
+    updateNotifTimeDisplay();
     // URLをクリーンに
     window.history.replaceState({}, '', window.location.pathname);
+  } else {
+    updateNotifTimeDisplay();
   }
+}
+
+// 最後の通知時刻をホーム画面に表示
+function updateNotifTimeDisplay(){
+  const raw = localStorage.getItem('tekuteku_last_notif');
+  const el = document.getElementById('last-notif-time');
+  if(!el) return;
+  if(!raw){ el.style.display='none'; return; }
+  const d = new Date(raw);
+  const now = new Date();
+  const diffMin = Math.round((now-d)/60000);
+  let label;
+  if(diffMin < 1) label='たった今';
+  else if(diffMin < 60) label=diffMin+'分前';
+  else if(diffMin < 60*24) label=Math.floor(diffMin/60)+'時間前';
+  else label=Math.floor(diffMin/1440)+'日前';
+  const h=d.getHours(), m=String(d.getMinutes()).padStart(2,'0');
+  el.textContent=`🔔 前回の通知：${h}:${m}（${label}）`;
+  el.style.display='block';
 }
 
 </script>
