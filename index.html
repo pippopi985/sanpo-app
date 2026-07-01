@@ -3,6 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="てくてく">
+<meta name="theme-color" content="#1a7a4a">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon.svg">
 <title>てくてく</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
@@ -285,6 +292,28 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
     </div>
 
     <button class="btn-sub" style="margin-top:0" onclick="shareMyRecord()">📤 友達に記録をシェアする</button>
+
+    <!-- 今日のミッション（お題）カード -->
+    <div id="mission-card" style="display:none;background:linear-gradient(135deg,#2563a8 0%,#1a4a8a 100%);border-radius:20px;padding:18px 18px 14px;margin:14px 0;color:#fff;position:relative;overflow:hidden">
+      <div style="position:absolute;right:-20px;top:-20px;font-size:80px;opacity:.15">📸</div>
+      <div style="font-size:11px;font-weight:700;opacity:.85;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">📸 今日のお題</div>
+      <div id="mission-text" style="font-size:20px;font-weight:900;line-height:1.3;margin-bottom:10px"></div>
+      <div id="mission-sub" style="font-size:12px;opacity:.85;margin-bottom:12px"></div>
+      <div style="display:flex;gap:8px">
+        <button onclick="openCameraForMission()" style="flex:1;padding:10px;border-radius:10px;border:none;background:rgba(255,255,255,.2);color:#fff;font-size:13px;font-weight:700;cursor:pointer">📷 写真を撮る</button>
+        <button onclick="dismissMission()" style="padding:10px 14px;border-radius:10px;border:none;background:rgba(255,255,255,.1);color:#fff;font-size:12px;cursor:pointer">後で</button>
+      </div>
+    </div>
+
+    <!-- 通知許可を求めるバナー -->
+    <div id="notif-banner" style="display:none;background:var(--green-light);border:1.5px solid #a5d6a7;border-radius:var(--radius);padding:13px 14px;margin-bottom:10px;display:flex;align-items:center;gap:10px">
+      <span style="font-size:22px">🔔</span>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:700;color:var(--green-deep)">毎日お題が届きます</div>
+        <div style="font-size:11px;color:var(--green);margin-top:2px">通知を許可して、外に出るきっかけを作ろう</div>
+      </div>
+      <button onclick="requestNotifPermission()" style="padding:8px 13px;border-radius:10px;border:none;background:var(--green);color:#fff;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap">許可する</button>
+    </div>
 
     <div class="section-lbl">どっちで歩く？</div>
     <div class="mode-grid">
@@ -868,7 +897,10 @@ getLoc().then(pos=>{ S.lat=pos.lat; S.lng=pos.lng; });
 // ============================================================
 window.addEventListener('DOMContentLoaded', async ()=>{
   const isShared = await checkAndShowSharedRecord();
-  if(!isShared) renderHome();
+  if(!isShared){
+    renderHome();
+    initPWA(); // PWA初期化（通知バナー・ミッション表示）
+  }
 });
 
 // ============================================================
@@ -2261,6 +2293,213 @@ function promptEditNickname(){
     setNickname(next.trim().slice(0,20));
     renderHome();
     syncToFirestore();
+  }
+}
+
+// ============================================================
+// PWA / プッシュ通知 / 今日のお題
+// ============================================================
+
+// FCMのVAPIDキー（Firebase Console → プロジェクトの設定 → Cloud Messaging → ウェブプッシュ証明書で取得）
+// ★ 後で実際のVAPIDキーに差し替えてください ★
+const VAPID_KEY = 'YOUR_VAPID_KEY';
+
+// FCMトークンの保存キー
+const FCM_TOKEN_KEY = 'tekuteku_fcm_token';
+
+// Service Worker登録
+async function registerServiceWorker(){
+  if(!('serviceWorker' in navigator)) return null;
+  try{
+    const reg = await navigator.serviceWorker.register('./firebase-messaging-sw.js');
+    return reg;
+  }catch(e){
+    console.warn('Service Worker登録失敗:', e.message);
+    return null;
+  }
+}
+
+// 通知許可バナーを表示するか判定
+function checkNotifBanner(){
+  const banner = document.getElementById('notif-banner');
+  if(!banner) return;
+  if(Notification.permission === 'default'){
+    banner.style.display = 'flex';
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
+// 通知許可を求める
+async function requestNotifPermission(){
+  document.getElementById('notif-banner').style.display = 'none';
+  try{
+    const permission = await Notification.requestPermission();
+    if(permission === 'granted'){
+      await setupFCM();
+      // 許可取得後すぐに今日のお題を表示
+      showTodayMission();
+    }
+  }catch(e){
+    console.warn('通知許可エラー:', e.message);
+  }
+}
+
+// FCMトークンを取得してFirestoreに保存
+async function setupFCM(){
+  if(!fbReady || !('Notification' in window) || Notification.permission !== 'granted') return;
+  if(VAPID_KEY === 'YOUR_VAPID_KEY'){
+    console.warn('VAPIDキー未設定のためFCM通知は送信されません');
+    return;
+  }
+  try{
+    await whenFbReadyAsync();
+    const messaging = firebase.messaging();
+    const swReg = await navigator.serviceWorker.ready;
+    const token = await messaging.getToken({ vapidKey: VAPID_KEY, serviceWorkerRegistration: swReg });
+    if(token){
+      localStorage.setItem(FCM_TOKEN_KEY, token);
+      // Firestoreにトークンを保存（サーバーからの通知送信に使う）
+      await fbDb.collection('walkers').doc(MY_USER_ID).set({
+        fcmToken: token,
+        tokenUpdatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+    }
+  }catch(e){
+    console.warn('FCMトークン取得失敗:', e.message);
+  }
+}
+
+// ============================================================
+// 今日のお題生成（時間帯・月から判断してローカルで生成）
+// API呼び出しなしで動作する。VAPIDキー設定後はFCMで自動送信に切り替わる
+// ============================================================
+const MISSION_KEY = 'tekuteku_mission_v1';
+
+const MISSIONS = {
+  morning: [ // 5〜10時
+    {text:'今日の空の色を撮って', sub:'青い空か曇り空か、今日の天気を記録しよう'},
+    {text:'朝の光が当たってる場所', sub:'窓から差し込む光でも、外の木漏れ日でも'},
+    {text:'今日の朝ごはん or コンビニ', sub:'今日のスタートを記録'},
+    {text:'今朝の道路や公園の様子', sub:'人が少ない朝の街を記録しよう'},
+    {text:'遠くの山や建物のシルエット', sub:'朝靄の中の景色を撮って'},
+  ],
+  noon: [ // 10〜15時
+    {text:'今日の川か水のある場所', sub:'川・池・水たまり、何でもOK'},
+    {text:'今日の空と雲', sub:'夏は入道雲、秋は高い雲を'},
+    {text:'街の中の緑', sub:'植木でも草むらでも、緑を見つけて'},
+    {text:'今日の影（自分か物の影）', sub:'晴れた日ほどドラマチックな影が撮れる'},
+    {text:'今日すれ違った景色', sub:'散歩中に気になったものを何でも'},
+  ],
+  evening: [ // 15〜18時
+    {text:'夕方の空', sub:'オレンジや紫に変わっていく空を記録'},
+    {text:'夕日が当たっている建物や木', sub:'黄金色の光は夕方だけのもの'},
+    {text:'今日の道路の様子', sub:'帰宅ラッシュ前の街を記録'},
+    {text:'窓越しの景色', sub:'カフェやお店の窓から見える景色を'},
+    {text:'今日一番歩いた道', sub:'散歩ルートの一コマを残しておこう'},
+  ],
+  night: [ // 18〜24時
+    {text:'夜景か明かりを撮って', sub:'ビル・街灯・コンビニ、夜の光なら何でも'},
+    {text:'今夜の月', sub:'月があれば最高。なければ星か夜空を'},
+    {text:'夜の繁華街か住宅地', sub:'同じ場所でも夜は全然違う顔を見せる'},
+    {text:'お店の看板や光る文字', sub:'ネオンや光る看板はナイトフォトの定番'},
+    {text:'今夜のリフレクション', sub:'水たまりや窓ガラスに映る光を探して'},
+  ]
+};
+
+function getTodayMissionData(){
+  const hour = new Date().getHours();
+  let timeKey;
+  if(hour >= 5 && hour < 10) timeKey='morning';
+  else if(hour >= 10 && hour < 15) timeKey='noon';
+  else if(hour >= 15 && hour < 18) timeKey='evening';
+  else timeKey='night';
+
+  const pool = MISSIONS[timeKey];
+  // 日付ベースのシード（同じ日なら同じお題）
+  const today = new Date().toISOString().slice(0,10);
+  const seed = today.split('').reduce((acc,c)=>acc+c.charCodeAt(0), 0);
+  const mission = pool[seed % pool.length];
+  return { ...mission, timeKey, date: today };
+}
+
+function showTodayMission(){
+  const card = document.getElementById('mission-card');
+  const textEl = document.getElementById('mission-text');
+  const subEl = document.getElementById('mission-sub');
+  if(!card || !textEl) return;
+
+  // 今日すでに撮影済みかチェック
+  const saved = localStorage.getItem(MISSION_KEY);
+  if(saved){
+    try{
+      const s = JSON.parse(saved);
+      if(s.date === new Date().toISOString().slice(0,10) && s.done){
+        card.style.display = 'none'; // 今日はクリア済み
+        return;
+      }
+    }catch(e){}
+  }
+
+  const mission = getTodayMissionData();
+  textEl.textContent = mission.text;
+  subEl.textContent = mission.sub;
+  card.style.display = 'block';
+}
+
+function dismissMission(){
+  document.getElementById('mission-card').style.display = 'none';
+}
+
+function openCameraForMission(){
+  // カメラ起動（ファイル選択inputを動的生成）
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.capture = 'environment'; // 背面カメラ優先
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if(!file) return;
+
+    // 撮影済みとしてマーク
+    const today = new Date().toISOString().slice(0,10);
+    localStorage.setItem(MISSION_KEY, JSON.stringify({ date: today, done: true }));
+
+    // ミッションカードを完了演出に切り替え
+    const card = document.getElementById('mission-card');
+    card.style.background = 'linear-gradient(135deg,#1a7a4a 0%,#0f5c35 100%)';
+    document.getElementById('mission-text').textContent = '✅ 今日のお題クリア！';
+    document.getElementById('mission-sub').textContent = 'お疲れ様でした。明日もお題が届きます';
+    card.querySelector('div:last-child').style.display = 'none'; // ボタン行を非表示
+
+    // 3秒後にカードを閉じる
+    setTimeout(()=>{ card.style.display='none'; }, 3000);
+  };
+  input.click();
+}
+
+// アプリ起動時：通知バナー・ミッション表示・FCMセットアップ
+async function initPWA(){
+  // Service Worker登録
+  await registerServiceWorker();
+
+  // FCM再セットアップ（許可済みの場合）
+  if('Notification' in window && Notification.permission === 'granted'){
+    setupFCM().catch(e=>console.warn('FCM再セットアップ失敗:', e.message));
+  }
+
+  // 通知許可バナー表示
+  if('Notification' in window) checkNotifBanner();
+
+  // 今日のお題表示
+  showTodayMission();
+
+  // 通知タップでアプリを開いた場合（?openMission=1 パラメータ）
+  const params = new URLSearchParams(window.location.search);
+  if(params.get('openMission')){
+    showTodayMission();
+    // URLをクリーンに
+    window.history.replaceState({}, '', window.location.pathname);
   }
 }
 
