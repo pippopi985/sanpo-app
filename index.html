@@ -364,6 +364,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
         </div>
       </div>
 
+      <div id="shared-mission-photo" style="display:none"></div>
       <div class="section-lbl">最近のさんぽ</div>
       <div id="shared-walk-list"></div>
     </div>
@@ -683,13 +684,18 @@ function whenFbReadyAsync(){ return new Promise(res=>{ if(fbReady) res(); else f
     const s2=document.createElement('script');
     s2.src='https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js';
     s2.onload=()=>{
-      try{
-        fbApp=firebase.initializeApp(FIREBASE_CONFIG);
-        fbDb=firebase.firestore();
-        fbReady=true;
-        fbReadyCbs.forEach(cb=>cb());
-        fbReadyCbs=[];
-      }catch(e){ console.warn('Firebase初期化失敗:', e.message); }
+      const s3=document.createElement('script');
+      s3.src='https://www.gstatic.com/firebasejs/10.12.0/firebase-storage-compat.js';
+      s3.onload=()=>{
+        try{
+          fbApp=firebase.initializeApp(FIREBASE_CONFIG);
+          fbDb=firebase.firestore();
+          fbReady=true;
+          fbReadyCbs.forEach(cb=>cb());
+          fbReadyCbs=[];
+        }catch(e){ console.warn('Firebase初期化失敗:', e.message); }
+      };
+      document.head.appendChild(s3);
     };
     document.head.appendChild(s2);
   };
@@ -2265,6 +2271,23 @@ function renderSharedRecord(data){
   document.getElementById('shared-total-walks').textContent=(data.totalWalks||0)+'回';
   document.getElementById('shared-total-km').textContent=(data.totalKm||0).toFixed(1)+'km';
 
+  // 最新のミッション写真を表示
+  const missionEl=document.getElementById('shared-mission-photo');
+  if(missionEl && data.latestMission && data.latestMission.photoUrl){
+    const m=data.latestMission;
+    const d=new Date(m.date);
+    const dateStr=(d.getMonth()+1)+'/'+d.getDate();
+    missionEl.style.display='block';
+    missionEl.innerHTML=`
+      <div class="section-lbl">📸 最近のお題写真</div>
+      <div style="background:linear-gradient(135deg,#2563a8 0%,#1a4a8a 100%);border-radius:16px;padding:14px;margin-bottom:14px">
+        <div style="font-size:11px;color:rgba(255,255,255,.8);margin-bottom:6px">${dateStr}のお題：${m.text||''}</div>
+        <img src="${m.photoUrl}" style="width:100%;border-radius:10px;max-height:220px;object-fit:cover" onerror="this.style.display='none'">
+      </div>`;
+  } else if(missionEl){
+    missionEl.style.display='none';
+  }
+
   const listEl=document.getElementById('shared-walk-list');
   const walks=data.recentWalks||[];
   if(walks.length===0){
@@ -2452,7 +2475,6 @@ function dismissMission(){
 }
 
 function openCameraForMission(){
-  // カメラ起動（ファイル選択inputを動的生成）
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = 'image/*';
@@ -2461,21 +2483,83 @@ function openCameraForMission(){
     const file = e.target.files[0];
     if(!file) return;
 
-    // 撮影済みとしてマーク
     const today = new Date().toISOString().slice(0,10);
-    localStorage.setItem(MISSION_KEY, JSON.stringify({ date: today, done: true }));
+    const mission = getTodayMissionData();
 
-    // ミッションカードを完了演出に切り替え
+    // ミッションカードをアップロード中に切り替え
     const card = document.getElementById('mission-card');
-    card.style.background = 'linear-gradient(135deg,#1a7a4a 0%,#0f5c35 100%)';
-    document.getElementById('mission-text').textContent = '✅ 今日のお題クリア！';
-    document.getElementById('mission-sub').textContent = 'お疲れ様でした。明日もお題が届きます';
-    card.querySelector('div:last-child').style.display = 'none'; // ボタン行を非表示
+    document.getElementById('mission-text').textContent = '📤 アップロード中…';
+    document.getElementById('mission-sub').textContent = '少しお待ちください';
+    card.querySelector('div:last-child').style.display = 'none';
 
-    // 3秒後にカードを閉じる
-    setTimeout(()=>{ card.style.display='none'; }, 3000);
+    try{
+      let photoUrl = null;
+
+      // Firebase Storageにアップロード（初期化済みの場合のみ）
+      if(fbReady && typeof firebase.storage === 'function'){
+        const storage = firebase.storage();
+        const ext = file.name.split('.').pop() || 'jpg';
+        const path = `missions/${MY_USER_ID}/${today}.${ext}`;
+        const ref = storage.ref(path);
+        await ref.put(file);
+        photoUrl = await ref.getDownloadURL();
+      } else {
+        // Storage未初期化の場合はBase64でローカル保存（フォールバック）
+        photoUrl = await fileToBase64(file);
+      }
+
+      // 撮影済みとしてローカルに記録
+      localStorage.setItem(MISSION_KEY, JSON.stringify({ date: today, done: true, photoUrl }));
+
+      // Firestoreにミッション写真を保存（共有ページで表示するため）
+      if(fbReady){
+        await fbDb.collection('walkers').doc(MY_USER_ID).set({
+          latestMission: {
+            date: today,
+            text: mission.text,
+            photoUrl,
+            uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
+          }
+        }, { merge: true });
+      }
+
+      // 完了演出
+      card.style.background = 'linear-gradient(135deg,#1a7a4a 0%,#0f5c35 100%)';
+      if(photoUrl && photoUrl.startsWith('http')){
+        // サムネイルを表示
+        card.innerHTML = `
+          <div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px">✅ 今日のお題クリア！</div>
+          <img src="${photoUrl}" style="width:100%;border-radius:10px;max-height:160px;object-fit:cover;margin-bottom:8px">
+          <div style="font-size:11px;color:rgba(255,255,255,.8)">友達の共有ページにも表示されます</div>
+        `;
+      } else {
+        document.getElementById('mission-text').textContent = '✅ 今日のお題クリア！';
+        document.getElementById('mission-sub').textContent = '明日もお題が届きます';
+      }
+
+      // 5秒後にカードを閉じる
+      setTimeout(()=>{ card.style.display='none'; }, 5000);
+
+    }catch(err){
+      console.error('写真アップロード失敗:', err);
+      // エラー時もクリア済みにはする
+      localStorage.setItem(MISSION_KEY, JSON.stringify({ date: today, done: true }));
+      card.style.background = 'linear-gradient(135deg,#1a7a4a 0%,#0f5c35 100%)';
+      document.getElementById('mission-text').textContent = '✅ 今日のお題クリア！';
+      document.getElementById('mission-sub').textContent = '写真の共有は次回お試しください';
+      setTimeout(()=>{ card.style.display='none'; }, 3000);
+    }
   };
   input.click();
+}
+
+function fileToBase64(file){
+  return new Promise((res,rej)=>{
+    const reader = new FileReader();
+    reader.onload = e => res(e.target.result);
+    reader.onerror = rej;
+    reader.readAsDataURL(file);
+  });
 }
 
 // アプリ起動時：通知バナー・ミッション表示・FCMセットアップ
