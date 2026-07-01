@@ -315,10 +315,16 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
       <button onclick="requestNotifPermission()" style="padding:8px 13px;border-radius:10px;border:none;background:var(--green);color:#fff;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap">許可する</button>
     </div>
 
-    <!-- 通知が届いた時刻 -->
-    <div id="last-notif-time" style="display:none;font-size:11px;color:var(--text-muted);font-weight:600;margin:-8px 0 8px;text-align:center"></div>
+    <!-- 今日の歩数 -->
+    <div id="today-steps" style="display:none;font-size:13px;font-weight:700;color:var(--green);background:var(--green-light);border-radius:10px;padding:10px 14px;margin-bottom:10px;text-align:center"></div>
 
-    <div class="section-lbl">どっちで歩く？</div>
+    <!-- 通知が届いた時刻 -->
+    <div id="last-notif-time" style="display:none;font-size:11px;color:var(--text-muted);font-weight:600;margin:-4px 0 8px;text-align:center"></div>
+
+    <div class="section-lbl" style="display:flex;justify-content:space-between;align-items:center">
+      <span>さんぽ履歴</span>
+      <button onclick="goScreen('photo-gallery')" style="font-size:11px;color:var(--green);font-weight:700;background:none;border:none;cursor:pointer">📸 写真を見る →</button>
+    </div>
     <div class="mode-grid">
       <div class="mode-card" onclick="goScreen('time-setup')">
         <div class="mode-emoji">🎲</div>
@@ -647,6 +653,22 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:28px;heigh
   </div>
 </div>
 
+<!-- ============================================================ -->
+<!-- F: 写真ギャラリー画面 -->
+<!-- ============================================================ -->
+<div class="screen" id="screen-photo-gallery">
+  <div class="status-bar"><span class="status-time" id="time-pg">9:41</span><span class="status-dots">●●●</span></div>
+  <div class="topnav">
+    <button class="back-link" onclick="goScreen('home')">← 戻る</button>
+  </div>
+  <div class="content">
+    <div class="lbl">フォトログ</div>
+    <div style="font-size:18px;font-weight:900;margin-bottom:14px">📸 お題の写真</div>
+    <div id="photo-gallery-list"></div>
+    <div class="spacer"></div>
+  </div>
+</div>
+
 </div>
 
 <script>
@@ -815,7 +837,8 @@ function goScreen(name){
   el.classList.add('active');
   el.classList.remove('screen-anim');
   requestAnimationFrame(()=>el.classList.add('screen-anim'));
-  if(name==='home') renderHome();
+  if(name==='home'){ renderHome(); showTodayMission(); updateNotifTimeDisplay(); }
+  if(name==='photo-gallery') renderPhotoGallery();
   // 新しい散歩フローの起点に来たら、前回の選択状態をリセット
   if(name==='time-setup' || name==='dest-search'){
     S.destPlace=null; S.selSpots=[]; S.spots=[]; S.autoRouteResult=null; S.route=null;
@@ -866,6 +889,20 @@ function renderHome(){
   const totalKm=D.walks.reduce((sum,w)=>sum+(w.km||0),0);
   document.getElementById('total-dist').textContent=totalKm.toFixed(1)+'km';
 
+  // 今日の歩数を集計（GPS実測ベース、日付が変わったら0にリセット）
+  const today=new Date().toISOString().slice(0,10);
+  const todaySteps=D.walks.filter(w=>w.date===today).reduce((s,w)=>s+(w.steps||0),0);
+  const stepsEl=document.getElementById('today-steps');
+  if(stepsEl){
+    if(todaySteps>0){
+      const stepsLabel=todaySteps>=1000?(todaySteps/1000).toFixed(1)+'k':todaySteps;
+      stepsEl.textContent=`👟 今日の歩数 約${stepsLabel}歩`;
+      stepsEl.style.display='block';
+    } else {
+      stepsEl.style.display='none';
+    }
+  }
+
   // 履歴リスト（直近5件）
   const histEl=document.getElementById('history-list');
   if(D.walks.length===0){
@@ -879,7 +916,7 @@ function renderHome(){
         <div class="history-icon">${w.mode==='destination'?'🎯':'🎲'}</div>
         <div class="history-info">
           <div class="history-name">${w.title||'さんぽ'}</div>
-          <div class="history-meta">${w.km?w.km.toFixed(1)+'km · ':''}${w.min||'-'}分 · スポット${w.spotCount||0}件</div>
+          <div class="history-meta">${w.km?w.km.toFixed(1)+'km · ':''}${w.min||'-'}分${w.steps?' · 約'+(w.steps>=1000?(w.steps/1000).toFixed(1)+'k歩':w.steps+'歩'):''} · スポット${w.spotCount||0}件</div>
         </div>
         <div class="history-date">${dateStr}</div>
       </div>`;
@@ -2415,6 +2452,56 @@ function renderSharedRecord(data){
 }
 
 // ニックネーム編集
+// ============================================================
+// 写真ギャラリー
+// ============================================================
+const PHOTO_HISTORY_KEY = 'tekuteku_photo_history_v1';
+
+function loadPhotoHistory(){
+  try{ return JSON.parse(localStorage.getItem(PHOTO_HISTORY_KEY)||'[]'); }
+  catch(e){ return []; }
+}
+
+function saveMissionPhotoToHistory(date, missionText, photoUrl){
+  const history = loadPhotoHistory();
+  // 同じ日の写真があれば上書き
+  const idx = history.findIndex(h=>h.date===date);
+  const entry = { date, missionText, photoUrl, savedAt: new Date().toISOString() };
+  if(idx>=0) history[idx]=entry;
+  else history.unshift(entry); // 新しいものを先頭に
+  // 最大100件まで保持
+  localStorage.setItem(PHOTO_HISTORY_KEY, JSON.stringify(history.slice(0,100)));
+}
+
+function renderPhotoGallery(){
+  const listEl = document.getElementById('photo-gallery-list');
+  if(!listEl) return;
+  const history = loadPhotoHistory();
+
+  if(history.length===0){
+    listEl.innerHTML=`<div class="empty-state"><div class="ee">📷</div><p>まだ写真がありません<br>お題に挑戦して写真を撮ってみよう！</p></div>`;
+    return;
+  }
+
+  listEl.innerHTML = history.map(h=>{
+    const d = new Date(h.date);
+    const dateStr = `${d.getMonth()+1}/${d.getDate()}`;
+    // 曜日
+    const days=['日','月','火','水','木','金','土'];
+    const dayStr = days[d.getDay()];
+    return `<div style="margin-bottom:18px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <div style="font-size:13px;font-weight:800;color:var(--text)">${dateStr}（${dayStr}）</div>
+        <div style="font-size:11px;color:var(--text-muted);font-weight:600;flex:1">📸 ${h.missionText}</div>
+      </div>
+      ${h.photoUrl
+        ? `<img src="${h.photoUrl}" style="width:100%;border-radius:14px;max-height:240px;object-fit:cover" onerror="this.parentElement.style.display='none'">`
+        : `<div style="background:var(--gray-1);border-radius:14px;height:120px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:13px">写真なし</div>`
+      }
+    </div>`;
+  }).join('');
+}
+
 function promptEditNickname(){
   const current=getNickname();
   const next=prompt('表示名を入力してください（友達に表示されます）', current);
@@ -2642,6 +2729,9 @@ function openCameraForMission(){
 
       // 撮影済みとしてローカルに記録
       localStorage.setItem(MISSION_KEY, JSON.stringify({ date: today, done: true, photoUrl }));
+
+      // 写真履歴に追記（ギャラリー画面で表示するため）
+      saveMissionPhotoToHistory(today, mission.text, photoUrl);
 
       // Firestoreにミッション写真を保存（共有ページで表示するため）
       if(fbReady){
