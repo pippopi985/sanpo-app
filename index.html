@@ -2770,61 +2770,65 @@ function openCameraForMission(){
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = 'image/*';
-  input.capture = 'environment'; // 背面カメラ優先
+  // capture属性はiOSでonchangeが発火しないバグの原因になるため削除
+  // iOSはaccept="image/*"だけでカメラか写真ライブラリを自分で選べる
+
   input.onchange = async (e) => {
-    removeCameraInput(input); // 先にDOMから削除
+    removeCameraInput(input);
     const file = e.target.files[0];
     if(!file) return;
 
     const today = new Date().toISOString().slice(0,10);
     const mission = getTodayMissionData();
-
-    // ミッションカードをアップロード中に切り替え
     const card = document.getElementById('mission-card');
-    document.getElementById('mission-text').textContent = '📤 アップロード中…';
-    document.getElementById('mission-sub').textContent = '少しお待ちください';
-    card.querySelector('div:last-child').style.display = 'none';
+
+    // アップロード中の表示（innerHTML全書き換えで安全に更新）
+    card.innerHTML = `
+      <div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px">📤 アップロード中…</div>
+      <div style="font-size:12px;color:rgba(255,255,255,.8)">少しお待ちください</div>
+    `;
+    card.style.display = 'block';
 
     try{
       let photoUrl = null;
 
-      // Firebase Storageにアップロード（初期化済みの場合のみ）
+      // Firebase Storageにアップロード
       if(fbReady && typeof firebase.storage === 'function'){
         const storage = firebase.storage();
-        const ext = file.name.split('.').pop() || 'jpg';
+        const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
         const path = `missions/${MY_USER_ID}/${today}.${ext}`;
         const ref = storage.ref(path);
         await ref.put(file);
         photoUrl = await ref.getDownloadURL();
       } else {
-        // Storage未初期化の場合はBase64でローカル保存（フォールバック）
+        // Storage未初期化の場合はBase64でローカル保存
         photoUrl = await fileToBase64(file);
       }
 
       // 撮影済みとしてローカルに記録
       localStorage.setItem(MISSION_KEY, JSON.stringify({ date: today, done: true, photoUrl }));
 
-      // 写真履歴に追記（ギャラリー画面で表示するため）
+      // 写真履歴に追記
       saveMissionPhotoToHistory(today, mission.text, photoUrl);
 
-      // Firestoreにミッション写真を保存（共有ページで表示するため）
+      // Firestoreにミッション写真を保存
       if(fbReady){
-        await fbDb.collection('walkers').doc(MY_USER_ID).set({
+        fbDb.collection('walkers').doc(MY_USER_ID).set({
           latestMission: {
             date: today,
             text: mission.text,
             photoUrl,
             uploadedAt: firebase.firestore.FieldValue.serverTimestamp()
           }
-        }, { merge: true });
+        }, { merge: true }).catch(e=>console.warn('Firestore保存失敗:', e.message));
       }
 
-      // 完了演出
+      // 完了表示（写真を表示したまま）
       card.style.background = 'linear-gradient(135deg,#1a7a4a 0%,#0f5c35 100%)';
       if(photoUrl && photoUrl.startsWith('http')){
         card.innerHTML = `
           <div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:8px">✅ 今日のお題クリア！</div>
-          <img src="${photoUrl}" style="width:100%;border-radius:10px;max-height:200px;object-fit:cover;margin-bottom:8px">
+          <img src="${photoUrl}" style="width:100%;border-radius:10px;max-height:220px;object-fit:cover;margin-bottom:8px">
           <div style="font-size:11px;color:rgba(255,255,255,.8)">友達の共有ページにも表示されます 📤</div>
         `;
       } else {
@@ -2833,28 +2837,24 @@ function openCameraForMission(){
           <div style="font-size:12px;color:rgba(255,255,255,.8)">明日もお題が届きます</div>
         `;
       }
-      // ※ 自動で消さない。翌日になるまでホームに表示し続ける
+      card.style.display = 'block';
 
     }catch(err){
       console.error('写真アップロード失敗:', err);
-      // エラー時もクリア済みにはする（写真なしでクリア表示）
       localStorage.setItem(MISSION_KEY, JSON.stringify({ date: today, done: true }));
       card.style.background = 'linear-gradient(135deg,#1a7a4a 0%,#0f5c35 100%)';
       card.innerHTML = `
         <div style="font-size:20px;font-weight:900;color:#fff;margin-bottom:6px">✅ 今日のお題クリア！</div>
-        <div style="font-size:12px;color:rgba(255,255,255,.8)">写真の共有は次回お試しください</div>
+        <div style="font-size:12px;color:rgba(255,255,255,.8)">写真の共有は次回お試しください（${err.message}）</div>
       `;
       card.style.display = 'block';
     }
   };
-  // iOSのSafariで1枚目が認識されないバグ対策：bodyに実際にappendしてからクリック
+
+  // iOSのSafariで1枚目が認識されないバグ対策：bodyにappendしてから遅延クリック
   input.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;width:1px;height:1px';
   document.body.appendChild(input);
-  // DOMに追加してから少し待ってクリック（iOS Safari対策）
-  setTimeout(()=>{
-    input.click();
-    // クリック後もinputはonchangeまでDOMに残す（onChange内でremoveする）
-  }, 50);
+  setTimeout(()=> input.click(), 50);
 }
 
 // input要素をDOMから安全に削除するヘルパー
